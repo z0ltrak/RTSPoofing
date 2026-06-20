@@ -349,6 +349,7 @@ class MITMProxy:
         self.camera_host = camera_host
         self.camera_port = camera_port
         self.args = args
+        self.inject_only = args.inject_only
         if args.mode == "inject":
             self.probe = RTPProbe(probe_duration=self.args.inject_delay, min_frames=30)
         else:
@@ -391,10 +392,14 @@ class MITMProxy:
 
         log.info("MITM tunnel open: client↔proxy↔camera(%s:%d)", self.camera_host, self.camera_port)
 
+        def forward_text_to_client(text: bytes):
+            if text:
+                self._send_downstream(text)
+
         # Parser for upstream (camera→us) to capture/track RTP
         up_parser = InterleavedParser(
             on_frame=self._on_upstream_frame,
-            on_text=lambda _: None,
+            on_text=forward_text_to_client
         )
 
         if self.inject_frames and self.args.mode == "inject":
@@ -449,8 +454,6 @@ class MITMProxy:
                     # Camera → client: capture & forward
                     log.debug(f"Data from CAMERA: {len(data)} bytes, first 20: {data[:20].hex()}")
                     up_parser.feed(data)
-                    if not self.args.inject_only:
-                        self._send_downstream(data)
                     self.stats["up_bytes"] += len(data)
                 else:
                     # Client → camera: forward transparently
@@ -508,6 +511,11 @@ class MITMProxy:
                 log.info("Capture limit %d reached — stopping capture.", limit)
                 self.capture_fh.close()
                 self.capture_fh = None
+
+        if not self.inject_only:
+            wire = build_interleaved_frame(channel, rtp_payload)
+            self._send_downstream(wire)
+
     # ──────────────────────────────────────────────────────────────────────────
     # Injection loop (runs in a daemon thread)
     # ──────────────────────────────────────────────────────────────────────────
@@ -555,6 +563,7 @@ class MITMProxy:
 
             # Build the RTSP interleaved frame and send downstream.
             wire = build_interleaved_frame(channel, new_payload)
+            log.debug(f"Injecting frame: channel={channel}, size={len(wire)}")
             self._send_downstream(wire)
             self.stats["injected"] += 1
 
@@ -579,6 +588,7 @@ class MITMProxy:
         """Send bytes toward the NVR/viewer (client side)."""
         with self._lock:
             try:
+                log.debug(f"Sending {len(data)} bytes to the client")
                 self.client_sock.sendall(data)
             except OSError as e:
                 log.warning("Downstream send error: %s", e)
