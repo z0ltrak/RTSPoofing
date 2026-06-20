@@ -103,7 +103,7 @@ log = logging.getLogger("mitm")
 # Capture file I/O
 # ──────────────────────────────────────────────────────────────────────────────
 
-RECORD_HEADER_FMT = "!IBBHx"  # total_len, channel, reserved, rtp_len, pad
+RECORD_HEADER_FMT = "!IBBH"  # total_len, channel, reserved, rtp_len, pad
 RECORD_HEADER_SIZE = struct.calcsize(RECORD_HEADER_FMT)  # should be 8
 
 
@@ -118,17 +118,17 @@ def write_captured_frame(fh, channel: int, rtp_payload: bytes):
     os.fsync(fh.fileno())
 
 
-def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
+def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]], dict]:
     """
     Load all captured frames.
-    Returns list of (channel, rtp_payload).
+    Returns list of (channel, rtp_payload) and params dict.
     """
     frames: List[Tuple[int, bytes]] = []
     params = {
         'pt': None,
         'ssrc': None,
         'ssrc_hex': None,
-        'codec_name': None,
+        'codec_name': 'Unknown',
         'fps': 25.0,
     }
 
@@ -140,15 +140,17 @@ def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
         total_len, channel, _reserved, rtp_len = struct.unpack_from(
             "!IBBH", data, offset
         )
+
         offset += RECORD_HEADER_SIZE
         if offset + rtp_len > len(data):
-            log.warning("Capture file truncated at fram %d", len(frames))
+            log.warning("Capture file truncated at frame %d", len(frames))
             break
-        payload = data[offset : offset + rtp_len]
-        offset += rtp_len
-        frames.append((channel,payload))
 
-        #Extraer parametros del primer frame
+        payload = data[offset:offset + rtp_len]
+        offset += rtp_len
+        frames.append((channel, payload))
+
+        # Extraer parámetros del primer frame
         if first_frame and len(payload) >= RTP_HDR_SIZE:
             flags, pt_m, seq, ts, ssrc = struct.unpack_from(RTP_HDR, payload, 0)
             pt = pt_m & 0x7F
@@ -156,7 +158,7 @@ def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
             params['ssrc'] = ssrc
             params['ssrc_hex'] = f"0x{ssrc:08X}"
 
-            #Intentar identificar el codec por PT
+            # Intentar identificar el codec por PT
             codec_map = {
                 26: "JPEG",
                 34: "H263",
@@ -169,31 +171,27 @@ def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]],dict]:
             params['codec_name'] = codec_map.get(pt, f"Unknown(pt={pt})")
             first_frame = False
 
+    # Estimar FPS del archivo (si hay suficientes frames)
+    if len(frames) >= 2:
+        try:
+            _, first_payload = frames[0]
+            _, last_payload = frames[-1]
+            if len(first_payload) >= RTP_HDR_SIZE and len(last_payload) >= RTP_HDR_SIZE:
+                flags1, pt_m1, seq1, first_ts, ssrc1 = struct.unpack_from(RTP_HDR, first_payload, 0)
+                flags2, pt_m2, seq2, last_ts, ssrc2 = struct.unpack_from(RTP_HDR, last_payload, 0)
+                if last_ts > first_ts:
+                    # Asumiendo clock rate de 90000 Hz (común para video)
+                    duration_sec = (last_ts - first_ts) / 90000.0
+                    if duration_sec > 0:
+                        params['fps'] = len(frames) / duration_sec
+        except Exception as e:
+            log.debug(f"FPS estimation failed: {e}")
 
-        #Estimar FPS del archivo (si hay suficientes frames)
-        if len(frames) >= 2:
-            #Usar timestamps RTP para estimar FPS
-            try:
-                _, frist_payload = frames[0]
-                _, last_payload = frames[-1]
-                if len(first_payload) >= RTP_HDR_SIZE and len(last_payload) >= RTP_HDR_SIZE:
-                    _, _, _, first_ts, _ = struct.unpack_from(RTP_HDR, first_payload, 0)
-                    _, _, _, last_ts, _ = struct.unpack_from(RTP_HDR, last_payload, 0)
-                    if last_ts > first_ts:
-                        #Asumiendo clock rate de 90000 Hz (comun para video)
-                        duration_sec = (last_ts - first_ts) / 90000.0
-                        if duration_Sec > 0:
-                            params['fps'] = len(frames) / duration_sec
+    log.info("Loaded %d frames from %s", len(frames), path)
+    log.info("Parametros detectados: PT=%s SSRC=%s FPS=%.1f Codec=%s",
+             params['pt'], params['ssrc_hex'], params['fps'], params['codec_name'])
 
-            except:
-                pass
-
-
-        log.info("Loaded %d frames from %s", len(frames), path)
-        log.info("Parametros detectados: PT=%s SSRC=%s FPS=%.1f Codec=%s", params['pt'], params['ssrc_hex'], params['fps'], params['codec_name'])
-
-        return frames, params
-
+    return frames, params
     
 
 
