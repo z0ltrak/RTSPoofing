@@ -115,7 +115,7 @@ def write_captured_frame(fh, channel: int, rtp_payload: bytes):
     fh.write(header)
     fh.write(rtp_payload)
     fh.flush()
-    os.fsync(fh.fileno())
+
 
 
 def read_capture_file(path: Path) -> Tuple[List[Tuple[int, bytes]], dict]:
@@ -309,6 +309,20 @@ class InterleavedParser:
                     logging.error(f"Error en on_frame: {e}")
         finally:
             self._processing = False
+
+
+
+def precise_sleep(seconds: float):
+    """
+    Sleep híbrido: time.sleep para la mayot parte del intervalo, busy-wait para los últimos ~1ms. Necesario para pacing estable >30fps
+    """
+    if seconds <= 0:
+        return
+    if seconds > 0.002:
+        time.sleep(seconds - 0.001)
+    end = time.monotonic() + seconds
+    while time.monotonic() < end:
+        pass
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -577,8 +591,12 @@ class MITMProxy:
             # Pace to target FPS.
             elapsed = time.monotonic() - t0
             sleep_t = interval - elapsed
-            if sleep_t > 0:
-                time.sleep(sleep_t)
+            if sleep_t > 0.002:
+                time.sleep(sleep_t - 0.001)
+
+            frame_end = t0 + interval
+            while time.monotonic() < frame_end:
+                pass
 
     # ──────────────────────────────────────────────────────────────────────────
     # Thread-safe send helpers
@@ -663,7 +681,7 @@ def serve(args: argparse.Namespace):
                     cap_path = cap_path.with_name(
                         f"{cap_path.stem}_s{session_n}{cap_path.suffix}"
                     )
-                capture_fh = open(cap_path, "ab", buffering=0)
+                capture_fh = open(cap_path, "ab", buffering=65536)
                 log.info("Capturing to %s", cap_path)
 
             proxy = MITMProxy(
