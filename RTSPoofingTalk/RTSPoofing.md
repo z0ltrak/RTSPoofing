@@ -569,7 +569,7 @@ transition: slide-left
 # Demo
 
 <div class="flex justify-center mt-4">
-  <img src="C:\Users\marti\Desktop\RTSPoofing\RTSPoofingTalk\gifs\let-it.gif" class="rounded-lg" style="height:250px"/>
+  <img src="/gifs/let-it.gif" class="rounded-lg" style="height:250px"/>
 </div>
 
 
@@ -645,7 +645,7 @@ transition: fade
 # Una última reflexión
 <v-click>
 <div class="flex justify-center mt-4">
-  <img src="C:\Users\marti\Desktop\RTSPoofing\RTSPoofingTalk\gifs\ооо.gif" class="rounded-lg" style="height:180px"/>
+  <img src="/gifs/ооо.gif" class="rounded-lg" style="height:180px"/>
 </div>
 
 
