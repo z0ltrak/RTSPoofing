@@ -1,0 +1,2 @@
+import { n as WsRpcTransportOptions, r as attachWsRpcTransport, t as DevframeNodeRpcSessionMeta } from "../../ws-server-C1LjmRnp.mjs";
+export { DevframeNodeRpcSessionMeta, WsRpcTransportOptions, attachWsRpcTransport };

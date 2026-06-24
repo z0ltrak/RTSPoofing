@@ -1,0 +1,19 @@
+import { d as DevframeNodeContext, r as DevframeDefinition } from "../devframe-BuR6n9ZD.mjs";
+
+//#region src/adapters/embedded.d.ts
+interface CreateEmbeddedOptions {
+  /** Target context the devframe is registered into. Required. */
+  ctx: DevframeNodeContext;
+}
+/**
+ * Register a devframe into an already-running devframe/Kit context at
+ * runtime. Mirrors what the Vite plugin scan does for devframes passed
+ * as plugin options, but exposes the same flow to callers that need
+ * dynamic, post-startup registration.
+ *
+ * The host owns the mount path; when a hosted mount is needed the
+ * effective default follows the hosted rule of `def.basePath ?? '/__<id>/'`.
+ */
+declare function createEmbedded(d: DevframeDefinition, options: CreateEmbeddedOptions): Promise<void>;
+//#endregion
+export { CreateEmbeddedOptions, createEmbedded };

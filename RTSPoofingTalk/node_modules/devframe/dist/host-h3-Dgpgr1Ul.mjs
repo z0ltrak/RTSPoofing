@@ -1,0 +1,1296 @@
+import { t as devframeReporter } from "./diagnostics-reporter-CBBZwoMv.mjs";
+import { t as diagnostics } from "./diagnostics-GitRGKbr.mjs";
+import { RpcFunctionsCollectorBase } from "./rpc/index.mjs";
+import { defineRpcFunction } from "./index.mjs";
+import { i as diagnostics$1, n as nanoid, r as createEventEmitter, t as createSharedState } from "./shared-state-BlBNYziY.mjs";
+import { defineDiagnostics } from "nostics";
+import { isatty } from "node:tty";
+import { formatWithOptions, inspect } from "node:util";
+import { existsSync } from "node:fs";
+import { homedir } from "node:os";
+import process$1 from "node:process";
+import { join } from "pathe";
+//#region src/node/host-agent.ts
+/**
+* Framework-neutral host aggregating the agent-exposed surface of a
+* devframe. Auto-discovers RPC functions with an `agent` field from
+* `ctx.rpc.definitions`, and accepts plugin-registered tools /
+* resources via `registerTool` / `registerResource`.
+*
+* @experimental
+*/
+var DevframeAgentHost = class {
+	context;
+	events = createEventEmitter();
+	tools = /* @__PURE__ */ new Map();
+	resources = /* @__PURE__ */ new Map();
+	_rpcUnsubscribe;
+	constructor(context) {
+		this.context = context;
+		this._rpcUnsubscribe = context.rpc.onChanged(() => {
+			this.events.emit("agent:manifest:changed");
+		});
+	}
+	registerTool(input) {
+		this._validateToolId(input.id);
+		const tool = this._projectTool(input);
+		this.tools.set(tool.id, {
+			tool,
+			handler: input.handler
+		});
+		this.events.emit("agent:tool:registered", tool);
+		this.events.emit("agent:manifest:changed");
+		return { unregister: () => this.unregisterTool(tool.id) };
+	}
+	unregisterTool(id) {
+		const existed = this.tools.delete(id);
+		if (existed) {
+			this.events.emit("agent:tool:unregistered", id);
+			this.events.emit("agent:manifest:changed");
+		}
+		return existed;
+	}
+	registerResource(input) {
+		if (this.resources.has(input.id)) throw diagnostics$1.DF0016({ id: input.id });
+		const resource = {
+			id: input.id,
+			name: input.name,
+			description: input.description,
+			mimeType: input.mimeType ?? "application/json",
+			uri: input.uri ?? `devframe://resource/${encodeURIComponent(input.id)}`
+		};
+		this.resources.set(resource.id, {
+			resource,
+			read: input.read
+		});
+		this.events.emit("agent:resource:registered", resource);
+		this.events.emit("agent:manifest:changed");
+		return { unregister: () => this.unregisterResource(resource.id) };
+	}
+	unregisterResource(id) {
+		const existed = this.resources.delete(id);
+		if (existed) {
+			this.events.emit("agent:resource:unregistered", id);
+			this.events.emit("agent:manifest:changed");
+		}
+		return existed;
+	}
+	list() {
+		const rpcTools = this._collectRpcTools();
+		const plainTools = Array.from(this.tools.values()).map((t) => t.tool);
+		const resources = Array.from(this.resources.values()).map((r) => r.resource);
+		return {
+			tools: [...rpcTools, ...plainTools],
+			resources
+		};
+	}
+	getTool(id) {
+		const plain = this.tools.get(id);
+		if (plain) return plain.tool;
+		return this._collectRpcTools().find((t) => t.id === id);
+	}
+	getResource(id) {
+		return this.resources.get(id)?.resource;
+	}
+	async invoke(id, args) {
+		const plain = this.tools.get(id);
+		if (plain?.handler) return await plain.handler(args);
+		const rpcDef = this._findRpcDefinition(id);
+		if (rpcDef) {
+			const positional = this._coercePositionalArgs(args, rpcDef);
+			return await this.context.rpc.invokeLocal(id, ...positional);
+		}
+		throw new Error(`[devframe/agent] tool "${id}" not found`);
+	}
+	async read(id) {
+		const entry = this.resources.get(id);
+		if (!entry) throw new Error(`[devframe/agent] resource "${id}" not found`);
+		return await entry.read();
+	}
+	/** @internal */
+	_dispose() {
+		this._rpcUnsubscribe?.();
+		this._rpcUnsubscribe = void 0;
+	}
+	_validateToolId(id) {
+		if (this.tools.has(id)) throw diagnostics$1.DF0015({ id });
+		if (this.context.rpc.definitions.get(id)?.agent) throw diagnostics$1.DF0015({ id });
+	}
+	_projectTool(input) {
+		if (!input.description || typeof input.description !== "string") throw diagnostics$1.DF0014({ name: input.id });
+		return {
+			id: input.id,
+			kind: "tool",
+			title: input.title ?? input.id,
+			description: input.description,
+			safety: input.safety ?? "action",
+			tags: input.tags,
+			inputSchema: input.inputSchema,
+			outputSchema: input.outputSchema,
+			examples: input.examples
+		};
+	}
+	_collectRpcTools() {
+		const out = [];
+		for (const [name, def] of this.context.rpc.definitions) {
+			const agent = def.agent;
+			if (!agent) continue;
+			if (!agent.description || typeof agent.description !== "string") throw diagnostics$1.DF0014({ name });
+			const type = def.type ?? "query";
+			const safety = agent.safety ?? inferSafety(type);
+			out.push({
+				id: name,
+				kind: "rpc",
+				title: agent.title ?? name,
+				description: agent.description,
+				safety,
+				tags: agent.tags,
+				rpcName: name,
+				examples: agent.examples
+			});
+		}
+		return out;
+	}
+	_findRpcDefinition(id) {
+		const def = this.context.rpc.definitions.get(id);
+		if (def?.agent) return def;
+	}
+	_coercePositionalArgs(args, def) {
+		if (Array.isArray(args)) return args;
+		if (args === void 0 || args === null) return [];
+		if (args && typeof args === "object") {
+			const obj = args;
+			const schemas = def.args;
+			if (schemas && schemas.length) return schemas.map((_, i) => obj[`arg${i}`]);
+			if (hasPositionalKeys(obj)) {
+				const out = [];
+				let i = 0;
+				while (`arg${i}` in obj) {
+					out.push(obj[`arg${i}`]);
+					i++;
+				}
+				return out;
+			}
+		}
+		return [args];
+	}
+};
+function inferSafety(type) {
+	if (type === "static" || type === "query") return "read";
+	return "action";
+}
+function hasPositionalKeys(obj) {
+	return "arg0" in obj;
+}
+//#endregion
+//#region src/node/host-diagnostics.ts
+var DevframeDiagnosticsHost = class {
+	context;
+	_registry = {};
+	logger = new Proxy({}, { get: (_, code) => this._registry[code] });
+	defineDiagnostics = (opts) => {
+		return defineDiagnostics({
+			...opts,
+			reporters: [devframeReporter, ...opts.reporters ?? []]
+		});
+	};
+	constructor(context, initialDefinitions = []) {
+		this.context = context;
+		for (const d of initialDefinitions) this.register(d);
+	}
+	register(diagnostics) {
+		Object.assign(this._registry, diagnostics);
+	}
+};
+//#endregion
+//#region ../../node_modules/.pnpm/obug@2.1.1/node_modules/obug/dist/core.js
+function coerce(value) {
+	if (value instanceof Error) return value.stack || value.message;
+	return value;
+}
+function selectColor(colors, namespace) {
+	let hash = 0;
+	for (let i = 0; i < namespace.length; i++) {
+		hash = (hash << 5) - hash + namespace.charCodeAt(i);
+		hash |= 0;
+	}
+	return colors[Math.abs(hash) % colors.length];
+}
+function matchesTemplate(search, template) {
+	let searchIndex = 0;
+	let templateIndex = 0;
+	let starIndex = -1;
+	let matchIndex = 0;
+	while (searchIndex < search.length) if (templateIndex < template.length && (template[templateIndex] === search[searchIndex] || template[templateIndex] === "*")) if (template[templateIndex] === "*") {
+		starIndex = templateIndex;
+		matchIndex = searchIndex;
+		templateIndex++;
+	} else {
+		searchIndex++;
+		templateIndex++;
+	}
+	else if (starIndex !== -1) {
+		templateIndex = starIndex + 1;
+		matchIndex++;
+		searchIndex = matchIndex;
+	} else return false;
+	while (templateIndex < template.length && template[templateIndex] === "*") templateIndex++;
+	return templateIndex === template.length;
+}
+function humanize(value) {
+	if (value >= 1e3) return `${(value / 1e3).toFixed(1)}s`;
+	return `${value}ms`;
+}
+let globalNamespaces = "";
+function createDebug$1(namespace, options) {
+	let prevTime;
+	let enableOverride;
+	let namespacesCache;
+	let enabledCache;
+	const debug = (...args) => {
+		if (!debug.enabled) return;
+		const curr = Date.now();
+		const diff = curr - (prevTime || curr);
+		prevTime = curr;
+		args[0] = coerce(args[0]);
+		if (typeof args[0] !== "string") args.unshift("%O");
+		let index = 0;
+		args[0] = args[0].replace(/%([a-z%])/gi, (match, format) => {
+			if (match === "%%") return "%";
+			index++;
+			const formatter = options.formatters[format];
+			if (typeof formatter === "function") {
+				const value = args[index];
+				match = formatter.call(debug, value);
+				args.splice(index, 1);
+				index--;
+			}
+			return match;
+		});
+		options.formatArgs.call(debug, diff, args);
+		debug.log(...args);
+	};
+	debug.extend = function(namespace$1, delimiter = ":") {
+		return createDebug$1(this.namespace + delimiter + namespace$1, {
+			useColors: this.useColors,
+			color: this.color,
+			formatArgs: this.formatArgs,
+			formatters: this.formatters,
+			inspectOpts: this.inspectOpts,
+			log: this.log,
+			humanize: this.humanize
+		});
+	};
+	Object.assign(debug, options);
+	debug.namespace = namespace;
+	Object.defineProperty(debug, "enabled", {
+		enumerable: true,
+		configurable: false,
+		get: () => {
+			if (enableOverride != null) return enableOverride;
+			if (namespacesCache !== globalNamespaces) {
+				namespacesCache = globalNamespaces;
+				enabledCache = enabled(namespace);
+			}
+			return enabledCache;
+		},
+		set: (v) => {
+			enableOverride = v;
+		}
+	});
+	return debug;
+}
+let names = [];
+let skips = [];
+function enable(namespaces$1) {
+	globalNamespaces = namespaces$1;
+	names = [];
+	skips = [];
+	const split = globalNamespaces.trim().replace(/\s+/g, ",").split(",").filter(Boolean);
+	for (const ns of split) if (ns[0] === "-") skips.push(ns.slice(1));
+	else names.push(ns);
+}
+function enabled(name) {
+	for (const skip of skips) if (matchesTemplate(name, skip)) return false;
+	for (const ns of names) if (matchesTemplate(name, ns)) return true;
+	return false;
+}
+//#endregion
+//#region ../../node_modules/.pnpm/obug@2.1.1/node_modules/obug/dist/node.js
+const colors = process.stderr.getColorDepth && process.stderr.getColorDepth() > 2 ? [
+	20,
+	21,
+	26,
+	27,
+	32,
+	33,
+	38,
+	39,
+	40,
+	41,
+	42,
+	43,
+	44,
+	45,
+	56,
+	57,
+	62,
+	63,
+	68,
+	69,
+	74,
+	75,
+	76,
+	77,
+	78,
+	79,
+	80,
+	81,
+	92,
+	93,
+	98,
+	99,
+	112,
+	113,
+	128,
+	129,
+	134,
+	135,
+	148,
+	149,
+	160,
+	161,
+	162,
+	163,
+	164,
+	165,
+	166,
+	167,
+	168,
+	169,
+	170,
+	171,
+	172,
+	173,
+	178,
+	179,
+	184,
+	185,
+	196,
+	197,
+	198,
+	199,
+	200,
+	201,
+	202,
+	203,
+	204,
+	205,
+	206,
+	207,
+	208,
+	209,
+	214,
+	215,
+	220,
+	221
+] : [
+	6,
+	2,
+	3,
+	4,
+	5,
+	1
+];
+const inspectOpts = Object.keys(process.env).filter((key) => /^debug_/i.test(key)).reduce((obj, key) => {
+	const prop = key.slice(6).toLowerCase().replace(/_([a-z])/g, (_, k) => k.toUpperCase());
+	let value = process.env[key];
+	const lowerCase = typeof value === "string" && value.toLowerCase();
+	if (value === "null") value = null;
+	else if (lowerCase === "yes" || lowerCase === "on" || lowerCase === "true" || lowerCase === "enabled") value = true;
+	else if (lowerCase === "no" || lowerCase === "off" || lowerCase === "false" || lowerCase === "disabled") value = false;
+	else value = Number(value);
+	obj[prop] = value;
+	return obj;
+}, {});
+function useColors() {
+	return "colors" in inspectOpts ? Boolean(inspectOpts.colors) : isatty(process.stderr.fd);
+}
+function getDate() {
+	if (inspectOpts.hideDate) return "";
+	return `${(/* @__PURE__ */ new Date()).toISOString()} `;
+}
+function formatArgs(diff, args) {
+	const { namespace: name, useColors: useColors$1 } = this;
+	if (useColors$1) {
+		const c = this.color;
+		const colorCode = `\u001B[3${c < 8 ? c : `8;5;${c}`}`;
+		const prefix = `  ${colorCode};1m${name} \u001B[0m`;
+		args[0] = prefix + args[0].split("\n").join(`\n${prefix}`);
+		args.push(`${colorCode}m+${this.humanize(diff)}\u001B[0m`);
+	} else args[0] = `${getDate()}${name} ${args[0]}`;
+}
+function log(...args) {
+	process.stderr.write(`${formatWithOptions(this.inspectOpts, ...args)}\n`);
+}
+const defaultOptions = {
+	useColors: useColors(),
+	formatArgs,
+	formatters: {
+		o(v) {
+			this.inspectOpts.colors = this.useColors;
+			return inspect(v, this.inspectOpts).split("\n").map((str) => str.trim()).join(" ");
+		},
+		O(v) {
+			this.inspectOpts.colors = this.useColors;
+			return inspect(v, this.inspectOpts);
+		}
+	},
+	inspectOpts,
+	log,
+	humanize
+};
+function createDebug(namespace, options) {
+	var _ref;
+	const color = (_ref = options && options.color) !== null && _ref !== void 0 ? _ref : selectColor(colors, namespace);
+	return createDebug$1(namespace, Object.assign(defaultOptions, { color }, options));
+}
+enable(process.env.DEBUG || "");
+//#endregion
+//#region src/node/rpc-shared-state.ts
+const debug$1 = createDebug("devframe:rpc:state:changed");
+const debugSubscribe = createDebug("devframe:rpc:state:subscribe");
+function createRpcSharedStateServerHost(rpc) {
+	const sharedState = /* @__PURE__ */ new Map();
+	const keyAddedListeners = /* @__PURE__ */ new Set();
+	function registerSharedState(key, state) {
+		const offs = [];
+		offs.push(state.on("updated", (fullState, patches, syncId) => {
+			if (patches) {
+				debug$1("patch", {
+					key,
+					syncId
+				});
+				rpc.broadcast({
+					method: "devframe:rpc:client-state:patch",
+					args: [
+						key,
+						patches,
+						syncId
+					],
+					filter: (client) => client.$meta.subscribedStates.has(key)
+				});
+			} else {
+				debug$1("updated", {
+					key,
+					syncId
+				});
+				rpc.broadcast({
+					method: "devframe:rpc:client-state:updated",
+					args: [
+						key,
+						fullState,
+						syncId
+					],
+					filter: (client) => client.$meta.subscribedStates.has(key)
+				});
+			}
+		}));
+		return () => {
+			for (const off of offs) off();
+		};
+	}
+	const host = {
+		get: async (key, options) => {
+			if (sharedState.has(key)) return sharedState.get(key);
+			if (options?.initialValue === void 0 && options?.sharedState === void 0) throw diagnostics$1.DF0013({ key });
+			debug$1("new-state", key);
+			const state = options.sharedState ?? createSharedState({
+				initialValue: options.initialValue,
+				enablePatches: false
+			});
+			registerSharedState(key, state);
+			sharedState.set(key, state);
+			for (const fn of keyAddedListeners) fn(key);
+			return state;
+		},
+		keys() {
+			return Array.from(sharedState.keys());
+		},
+		onKeyAdded(fn) {
+			keyAddedListeners.add(fn);
+			return () => {
+				keyAddedListeners.delete(fn);
+			};
+		}
+	};
+	rpc.register({
+		name: "devframe:rpc:server-state:subscribe",
+		type: "event",
+		handler(key) {
+			const session = rpc.getCurrentRpcSession();
+			if (!session) return;
+			debugSubscribe("subscribe", {
+				key,
+				session: session.meta.id
+			});
+			session.meta.subscribedStates.add(key);
+		}
+	});
+	rpc.register({
+		name: "devframe:rpc:server-state:get",
+		type: "query",
+		handler: async (key) => {
+			if (!sharedState.has(key)) return void 0;
+			return (await host.get(key)).value();
+		},
+		dump: () => ({ inputs: host.keys().map((key) => [key]) })
+	});
+	rpc.register({
+		name: "devframe:rpc:server-state:set",
+		type: "query",
+		handler: async (key, value, syncId) => {
+			(await host.get(key, { initialValue: value })).mutate(() => value, syncId);
+		}
+	});
+	rpc.register({
+		name: "devframe:rpc:server-state:patch",
+		type: "query",
+		handler: async (key, patches, syncId) => {
+			if (!sharedState.has(key)) return;
+			(await host.get(key)).patch(patches, syncId);
+		}
+	});
+	return host;
+}
+//#endregion
+//#region src/utils/streaming-channel.ts
+const DEFAULT_HIGH_WATER_MARK = 256;
+var StreamClosedError = class extends Error {
+	name = "StreamClosedError";
+};
+/**
+* Build a server-side stream sink. RPC-agnostic — the RPC host wires
+* `events.on('chunk' | 'end')` to broadcast, and reads `buffer` to replay
+* for late or reconnecting subscribers.
+*/
+function createStreamSink(options = {}) {
+	const id = options.id ?? nanoid();
+	const replayWindow = Math.max(0, options.replayWindow ?? 0);
+	const events = createEventEmitter();
+	const controller = new AbortController();
+	const buffer = [];
+	let closed = false;
+	let lastSeq = 0;
+	function write(chunk) {
+		if (closed) throw new StreamClosedError(`Cannot write to a closed stream "${id}"`);
+		lastSeq += 1;
+		if (replayWindow > 0) {
+			buffer.push({
+				seq: lastSeq,
+				chunk
+			});
+			if (buffer.length > replayWindow) buffer.splice(0, buffer.length - replayWindow);
+		}
+		events.emit("chunk", lastSeq, chunk);
+	}
+	function error(reason) {
+		if (closed) return;
+		closed = true;
+		const payload = toErrorPayload(reason);
+		controller.abort(reason);
+		events.emit("end", payload);
+	}
+	function close() {
+		if (closed) return;
+		closed = true;
+		if (!controller.signal.aborted) controller.abort("stream closed");
+		events.emit("end", void 0);
+	}
+	function abort(reason) {
+		if (closed) return;
+		if (!controller.signal.aborted) controller.abort(reason ?? "aborted");
+	}
+	const writable = new WritableStream({
+		write(chunk) {
+			write(chunk);
+		},
+		close() {
+			close();
+		},
+		abort(reason) {
+			error(reason);
+		}
+	});
+	return {
+		id,
+		signal: controller.signal,
+		get closed() {
+			return closed;
+		},
+		get lastSeq() {
+			return lastSeq;
+		},
+		write,
+		error,
+		close,
+		abort,
+		writable,
+		events,
+		buffer
+	};
+}
+/**
+* Build a client-side stream reader. RPC-agnostic — the RPC host calls
+* `_push(seq, chunk)` on each incoming chunk and `_end(error?)` on the
+* terminal frame. Consumers iterate with `for await` or pipe `readable`.
+*/
+function createStreamReader(options = {}) {
+	const id = options.id ?? nanoid();
+	const highWaterMark = Math.max(1, options.highWaterMark ?? DEFAULT_HIGH_WATER_MARK);
+	const queue = [];
+	let lastSeenSeq = 0;
+	let done = false;
+	let cancelled = false;
+	let endError;
+	let pending;
+	let pullController;
+	let readableInstance;
+	function drainNext() {
+		if (!pending) return;
+		if (queue.length > 0) {
+			const value = queue.shift();
+			const r = pending;
+			pending = void 0;
+			r.resolve({
+				value,
+				done: false
+			});
+			return;
+		}
+		if (done) {
+			const r = pending;
+			pending = void 0;
+			if (endError) {
+				const err = new Error(endError.message);
+				err.name = endError.name;
+				r.reject(err);
+			} else r.resolve({
+				value: void 0,
+				done: true
+			});
+		}
+	}
+	function feedReadable() {
+		if (!pullController) return;
+		while (queue.length > 0) {
+			const v = queue.shift();
+			try {
+				pullController.enqueue(v);
+			} catch {
+				break;
+			}
+		}
+		if (done && pullController) {
+			try {
+				if (endError) {
+					const err = new Error(endError.message);
+					err.name = endError.name;
+					pullController.error(err);
+				} else pullController.close();
+			} catch {}
+			pullController = void 0;
+		}
+	}
+	function push(seq, chunk) {
+		if (done || cancelled) return;
+		if (seq <= lastSeenSeq) return;
+		lastSeenSeq = seq;
+		queue.push(chunk);
+		if (queue.length > highWaterMark) {
+			const overflow = queue.length - highWaterMark;
+			queue.splice(0, overflow);
+			options.onOverflow?.(overflow);
+		}
+		drainNext();
+		if (readableInstance) feedReadable();
+	}
+	function end(error) {
+		if (done) return;
+		done = true;
+		endError = error;
+		drainNext();
+		if (readableInstance) feedReadable();
+	}
+	function cancel() {
+		if (cancelled || done) return;
+		cancelled = true;
+		options.onCancel?.();
+		end(void 0);
+	}
+	function getReadable() {
+		if (readableInstance) return readableInstance;
+		readableInstance = new ReadableStream({
+			start(controller) {
+				pullController = controller;
+				feedReadable();
+			},
+			cancel() {
+				cancel();
+			}
+		});
+		return readableInstance;
+	}
+	return {
+		id,
+		get cancelled() {
+			return cancelled;
+		},
+		get done() {
+			return done;
+		},
+		get lastSeenSeq() {
+			return lastSeenSeq;
+		},
+		get readable() {
+			return getReadable();
+		},
+		cancel,
+		_push: push,
+		_end: end,
+		[Symbol.asyncIterator]() {
+			return {
+				next() {
+					if (queue.length > 0) return Promise.resolve({
+						value: queue.shift(),
+						done: false
+					});
+					if (done) {
+						if (endError) {
+							const err = new Error(endError.message);
+							err.name = endError.name;
+							return Promise.reject(err);
+						}
+						return Promise.resolve({
+							value: void 0,
+							done: true
+						});
+					}
+					return new Promise((resolve, reject) => {
+						pending = {
+							resolve,
+							reject
+						};
+					});
+				},
+				return() {
+					cancel();
+					return Promise.resolve({
+						value: void 0,
+						done: true
+					});
+				}
+			};
+		}
+	};
+}
+function toErrorPayload(reason) {
+	if (reason instanceof Error) return {
+		name: reason.name || "Error",
+		message: reason.message
+	};
+	if (typeof reason === "string") return {
+		name: "Error",
+		message: reason
+	};
+	try {
+		return {
+			name: "Error",
+			message: JSON.stringify(reason)
+		};
+	} catch {
+		return {
+			name: "Error",
+			message: String(reason)
+		};
+	}
+}
+//#endregion
+//#region src/node/rpc-streaming.ts
+const debug = createDebug("devframe:rpc:streaming");
+const STREAM_KEY_SEPARATOR = "";
+function streamKey(channel, id) {
+	return `${channel}${STREAM_KEY_SEPARATOR}${id}`;
+}
+/**
+* Build the server-side streaming host. Mirrors the layout of
+* `createRpcSharedStateServerHost` — registers a fixed set of internal
+* RPC methods (`subscribe` / `unsubscribe` / `cancel`) once, then per-channel
+* state lives in a `Map<channelName, ChannelState>`.
+*/
+function createRpcStreamingServerHost(rpc) {
+	const channels = /* @__PURE__ */ new Map();
+	function findStream(channelName, id) {
+		return channels.get(channelName)?.streams.get(id);
+	}
+	function freeStreamNow(state, id) {
+		const record = state.streams.get(id);
+		if (!record) return;
+		if (record.retentionTimer) {
+			clearTimeout(record.retentionTimer);
+			record.retentionTimer = void 0;
+		}
+		for (const off of record.unbinders) off();
+		state.streams.delete(id);
+		debug("freed", state.name, id);
+	}
+	function maybeFreeStream(state, id) {
+		const record = state.streams.get(id);
+		if (!record) return;
+		if (!record.sink.closed || record.subscribers.size > 0) return;
+		const retention = state.options.closedStreamRetention;
+		if (retention <= 0) {
+			freeStreamNow(state, id);
+			return;
+		}
+		if (record.retentionTimer) return;
+		record.retentionTimer = setTimeout(freeStreamNow, retention, state, id);
+	}
+	function cancelRetention(record) {
+		if (record.retentionTimer) {
+			clearTimeout(record.retentionTimer);
+			record.retentionTimer = void 0;
+		}
+	}
+	rpc.register({
+		name: "devframe:streaming:subscribe",
+		type: "event",
+		handler(channelName, id, opts) {
+			const state = channels.get(channelName);
+			if (!state) {
+				diagnostics$1.DF0030({
+					channel: channelName,
+					id
+				}, { method: "error" });
+				return;
+			}
+			const record = state.streams.get(id);
+			if (!record) {
+				diagnostics$1.DF0030({
+					channel: channelName,
+					id
+				}, { method: "error" });
+				return;
+			}
+			const session = rpc.getCurrentRpcSession();
+			if (!session) return;
+			const key = streamKey(channelName, id);
+			session.meta.subscribedStreams ??= /* @__PURE__ */ new Set();
+			session.meta.subscribedStreams.add(key);
+			record.subscribers.add(session.meta);
+			cancelRetention(record);
+			const afterSeq = opts?.afterSeq ?? 0;
+			for (const buffered of record.sink.buffer) if (buffered.seq > afterSeq) rpc.broadcast({
+				method: "devframe:streaming:chunk",
+				args: [
+					channelName,
+					id,
+					buffered.seq,
+					buffered.chunk
+				],
+				event: true,
+				optional: true,
+				filter: (client) => client.$meta === session.meta
+			});
+			if (record.sink.closed) rpc.broadcast({
+				method: "devframe:streaming:end",
+				args: [
+					channelName,
+					id,
+					void 0
+				],
+				event: true,
+				optional: true,
+				filter: (client) => client.$meta === session.meta
+			});
+		}
+	});
+	rpc.register({
+		name: "devframe:streaming:unsubscribe",
+		type: "event",
+		handler(channelName, id) {
+			const state = channels.get(channelName);
+			const record = state?.streams.get(id);
+			const session = rpc.getCurrentRpcSession();
+			if (!session) return;
+			session.meta.subscribedStreams?.delete(streamKey(channelName, id));
+			if (state && record) {
+				record.subscribers.delete(session.meta);
+				maybeFreeStream(state, id);
+			}
+		}
+	});
+	rpc.register({
+		name: "devframe:streaming:cancel",
+		type: "event",
+		handler(channelName, id) {
+			const record = findStream(channelName, id);
+			if (!record) return;
+			const session = rpc.getCurrentRpcSession();
+			if (!session) return;
+			record.subscribers.delete(session.meta);
+			session.meta.subscribedStreams?.delete(streamKey(channelName, id));
+			if (record.subscribers.size === 0) record.sink.abort("cancelled by client");
+		}
+	});
+	rpc.register({
+		name: "devframe:streaming:upload-chunk",
+		type: "event",
+		handler(channelName, id, seq, chunk) {
+			const record = channels.get(channelName)?.inbound.get(id);
+			if (!record) {
+				diagnostics$1.DF0030({
+					channel: channelName,
+					id
+				}, { method: "error" });
+				return;
+			}
+			if (!record.uploaderMeta) {
+				const session = rpc.getCurrentRpcSession();
+				if (session) {
+					record.uploaderMeta = session.meta;
+					session.meta.uploadingStreams ??= /* @__PURE__ */ new Set();
+					session.meta.uploadingStreams.add(streamKey(channelName, id));
+				}
+			}
+			record.reader._push(seq, chunk);
+		}
+	});
+	rpc.register({
+		name: "devframe:streaming:upload-end",
+		type: "event",
+		handler(channelName, id, error) {
+			const state = channels.get(channelName);
+			const record = state?.inbound.get(id);
+			if (!record) return;
+			record.reader._end(error);
+			if (record.uploaderMeta) record.uploaderMeta.uploadingStreams?.delete(streamKey(channelName, id));
+			state?.inbound.delete(id);
+		}
+	});
+	function createChannel(name, opts = {}) {
+		if (channels.has(name)) throw diagnostics$1.DF0032({ channel: name });
+		const replayWindow = opts.replayWindow ?? 0;
+		const state = {
+			name,
+			options: {
+				replayWindow,
+				closedStreamRetention: opts.closedStreamRetention ?? (replayWindow > 0 ? 3e4 : 0)
+			},
+			streams: /* @__PURE__ */ new Map(),
+			inbound: /* @__PURE__ */ new Map()
+		};
+		channels.set(name, state);
+		function start(startOpts = {}) {
+			const sink = createStreamSink({
+				id: startOpts.id,
+				replayWindow: state.options.replayWindow
+			});
+			const record = {
+				sink,
+				subscribers: /* @__PURE__ */ new Set(),
+				unbinders: []
+			};
+			state.streams.set(sink.id, record);
+			record.unbinders.push(sink.events.on("chunk", (seq, chunk) => {
+				rpc.broadcast({
+					method: "devframe:streaming:chunk",
+					args: [
+						name,
+						sink.id,
+						seq,
+						chunk
+					],
+					event: true,
+					optional: true,
+					filter: (client) => record.subscribers.has(client.$meta)
+				});
+			}));
+			record.unbinders.push(sink.events.on("end", (error) => {
+				rpc.broadcast({
+					method: "devframe:streaming:end",
+					args: [
+						name,
+						sink.id,
+						error
+					],
+					event: true,
+					optional: true,
+					filter: (client) => record.subscribers.has(client.$meta)
+				});
+				maybeFreeStream(state, sink.id);
+			}));
+			return sink;
+		}
+		async function pipeFrom(readable, startOpts = {}) {
+			const sink = start(startOpts);
+			readable.pipeTo(sink.writable, { signal: sink.signal }).catch(() => {});
+			return sink;
+		}
+		function get(id) {
+			return state.streams.get(id)?.sink;
+		}
+		function ids() {
+			return Array.from(state.streams.keys());
+		}
+		function openInbound(inboundOpts = {}) {
+			let inboundRecord;
+			const reader = createStreamReader({
+				id: inboundOpts.id,
+				onCancel() {
+					const targetMeta = inboundRecord?.uploaderMeta;
+					if (!targetMeta) return;
+					rpc.broadcast({
+						method: "devframe:streaming:upload-cancel",
+						args: [name, reader.id],
+						event: true,
+						optional: true,
+						filter: (client) => client.$meta === targetMeta
+					});
+				}
+			});
+			inboundRecord = { reader };
+			state.inbound.set(reader.id, inboundRecord);
+			debug("opened-inbound", name, reader.id);
+			return reader;
+		}
+		return {
+			name,
+			start,
+			pipeFrom,
+			get,
+			ids,
+			openInbound
+		};
+	}
+	function parseKey(key) {
+		const sepIdx = key.indexOf(STREAM_KEY_SEPARATOR);
+		if (sepIdx < 0) return void 0;
+		return {
+			channelName: key.slice(0, sepIdx),
+			id: key.slice(sepIdx + 1)
+		};
+	}
+	return {
+		create: createChannel,
+		_onSessionDisconnected(meta) {
+			if (meta.subscribedStreams) {
+				for (const key of meta.subscribedStreams) {
+					const parsed = parseKey(key);
+					if (!parsed) continue;
+					const state = channels.get(parsed.channelName);
+					const record = state?.streams.get(parsed.id);
+					if (!state || !record) continue;
+					record.subscribers.delete(meta);
+					if (record.subscribers.size === 0 && !record.sink.closed) record.sink.abort("all subscribers disconnected");
+					maybeFreeStream(state, parsed.id);
+				}
+				meta.subscribedStreams.clear();
+			}
+			if (meta.uploadingStreams) {
+				for (const key of meta.uploadingStreams) {
+					const parsed = parseKey(key);
+					if (!parsed) continue;
+					const state = channels.get(parsed.channelName);
+					const record = state?.inbound.get(parsed.id);
+					if (!state || !record) continue;
+					record.reader._end({
+						name: "UploadDisconnected",
+						message: "Uploader disconnected before completing the stream"
+					});
+					state.inbound.delete(parsed.id);
+				}
+				meta.uploadingStreams.clear();
+			}
+		}
+	};
+}
+//#endregion
+//#region src/node/host-functions.ts
+const debugBroadcast = createDebug("devframe:rpc:broadcast");
+var RpcFunctionsHost = class extends RpcFunctionsCollectorBase {
+	/**
+	* @internal
+	*/
+	_rpcGroup = void 0;
+	_asyncStorage = void 0;
+	constructor(context) {
+		super(context);
+		this.sharedState = createRpcSharedStateServerHost(this);
+		this.streaming = createRpcStreamingServerHost(this);
+	}
+	sharedState;
+	streaming;
+	/**
+	* Adapters call this from their WS `onDisconnected` hook so downstream
+	* hosts (streaming, …) can free per-session state. Public-ish because
+	* tests / custom adapters may want to mirror it.
+	*
+	* @internal
+	*/
+	_emitSessionDisconnected(meta) {
+		this.streaming._onSessionDisconnected(meta);
+	}
+	async invokeLocal(method, ...args) {
+		if (!this.definitions.has(method)) throw diagnostics$1.DF0006({ name: String(method) });
+		const handler = await this.getHandler(method);
+		return await Promise.resolve(handler(...args));
+	}
+	async broadcast(options) {
+		if (!this._rpcGroup) return;
+		debugBroadcast(JSON.stringify(options.method));
+		await Promise.allSettled(this._rpcGroup.clients.map((client) => {
+			if (options.filter?.(client) === false) return void 0;
+			return client.$callRaw({
+				optional: true,
+				event: true,
+				...options
+			});
+		}));
+	}
+	getCurrentRpcSession() {
+		if (!this._asyncStorage) throw diagnostics$1.DF0007();
+		return this._asyncStorage.getStore();
+	}
+};
+//#endregion
+//#region src/node/host-views.ts
+var DevframeViewHost = class {
+	context;
+	/**
+	* @internal
+	*/
+	buildStaticDirs = [];
+	constructor(context) {
+		this.context = context;
+	}
+	hostStatic(baseUrl, distDir) {
+		if (!existsSync(distDir)) throw diagnostics$1.DF0008({ distDir });
+		this.buildStaticDirs.push({
+			baseUrl,
+			distDir
+		});
+		this.context.host.mountStatic(baseUrl, distDir);
+	}
+};
+//#endregion
+//#region src/node/rpc/agent-invoke-tool.ts
+const agentInvokeTool = defineRpcFunction({
+	name: "devframe:agent:invoke-tool",
+	type: "action",
+	setup: (ctx) => {
+		return { async handler(id, args) {
+			return await ctx.agent.invoke(id, args);
+		} };
+	}
+});
+//#endregion
+//#region src/node/rpc/agent-list-resources.ts
+const agentListResources = defineRpcFunction({
+	name: "devframe:agent:list-resources",
+	type: "query",
+	jsonSerializable: true,
+	setup: (ctx) => {
+		return { async handler() {
+			return ctx.agent.list().resources;
+		} };
+	}
+});
+//#endregion
+//#region src/node/rpc/index.ts
+/**
+* Built-in agent introspection RPC functions. Registered automatically
+* by `createHostContext`. Not themselves agent-exposed (no `agent`
+* field) — they power the MCP adapter and any future agent CLI.
+*
+* @experimental
+*/
+const BUILTIN_AGENT_RPC = [
+	defineRpcFunction({
+		name: "devframe:agent:list-tools",
+		type: "query",
+		jsonSerializable: true,
+		setup: (ctx) => {
+			return { async handler() {
+				return ctx.agent.list().tools;
+			} };
+		}
+	}),
+	agentInvokeTool,
+	agentListResources,
+	defineRpcFunction({
+		name: "devframe:agent:read-resource",
+		type: "query",
+		jsonSerializable: true,
+		setup: (ctx) => {
+			return { async handler(id) {
+				return await ctx.agent.read(id);
+			} };
+		}
+	})
+];
+//#endregion
+//#region src/node/context.ts
+/**
+* Framework- and build-tool-agnostic core of the Devframe node context.
+* Wires the RPC host, view (HTTP file-serving) host, diagnostics, and
+* agent subsystems. Host adapters can wrap this to augment `ctx` with
+* extra surfaces — for example, `@vitejs/devtools-kit`'s
+* `createKitContext` attaches `docks`, `terminals`, `messages`,
+* `commands`, and `createJsonRenderer` when mounted into Vite DevTools.
+*/
+async function createHostContext(options) {
+	const { cwd, workspaceRoot = cwd, mode, host, builtinRpcDeclarations = [] } = options;
+	const context = {
+		cwd,
+		workspaceRoot,
+		mode,
+		host,
+		rpc: void 0,
+		views: void 0,
+		diagnostics: void 0,
+		agent: void 0
+	};
+	const rpcHost = new RpcFunctionsHost(context);
+	const viewsHost = new DevframeViewHost(context);
+	const diagnosticsHost = new DevframeDiagnosticsHost(context, [diagnostics$1, diagnostics]);
+	context.rpc = rpcHost;
+	context.views = viewsHost;
+	context.diagnostics = diagnosticsHost;
+	context.agent = new DevframeAgentHost(context);
+	for (const fn of BUILTIN_AGENT_RPC) rpcHost.register(fn);
+	for (const fn of builtinRpcDeclarations) rpcHost.register(fn);
+	return context;
+}
+//#endregion
+//#region src/node/host-h3.ts
+/**
+* h3-backed {@link DevframeHost} — used by the standalone CLI adapter.
+*/
+function createH3DevframeHost(options) {
+	const workspaceRoot = options.workspaceRoot ?? process$1.cwd();
+	return {
+		mountStatic(base, distDir) {
+			return options.mount?.(base, distDir);
+		},
+		resolveOrigin() {
+			return options.origin;
+		},
+		getStorageDir(scope) {
+			const namespace = `.${options.appName}/devframe`;
+			return scope === "workspace" ? join(workspaceRoot, "node_modules", namespace) : join(homedir(), namespace);
+		}
+	};
+}
+//#endregion
+export { createRpcStreamingServerHost as a, DevframeAgentHost as c, RpcFunctionsHost as i, createHostContext as n, createRpcSharedStateServerHost as o, DevframeViewHost as r, DevframeDiagnosticsHost as s, createH3DevframeHost as t };
