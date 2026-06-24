@@ -1,0 +1,80 @@
+{
+  "name": "unplugin-vue-markdown",
+  "type": "module",
+  "version": "32.0.0",
+  "description": "Compile Markdown to Vue component",
+  "author": "Anthony Fu <anthonyfu117@hotmail.com>",
+  "license": "MIT",
+  "funding": "https://github.com/sponsors/antfu",
+  "homepage": "https://github.com/unplugin/unplugin-vue-markdown",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/unplugin/unplugin-vue-markdown"
+  },
+  "bugs": "https://github.com/unplugin/unplugin-vue-markdown/issues",
+  "keywords": [
+    "vite",
+    "unplugin",
+    "markdown-exit"
+  ],
+  "sideEffects": false,
+  "exports": {
+    ".": "./dist/index.mjs",
+    "./esbuild": "./dist/esbuild.mjs",
+    "./rollup": "./dist/rollup.mjs",
+    "./rspack": "./dist/rspack.mjs",
+    "./types": "./dist/types.mjs",
+    "./vite": "./dist/vite.mjs",
+    "./webpack": "./dist/webpack.mjs",
+    "./package.json": "./package.json"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
+  "peerDependencies": {
+    "vite": "^2.0.0 || ^3.0.0-0 || ^4.0.0-0 || ^5.0.0-0 || ^6.0.0 || ^7.0.0 || ^8.0.0-0"
+  },
+  "dependencies": {
+    "@mdit-vue/plugin-component": "^3.0.2",
+    "@mdit-vue/plugin-frontmatter": "^3.0.2",
+    "@mdit-vue/types": "^3.0.2",
+    "markdown-exit": "^1.0.0-beta.9",
+    "unplugin": "^3.0.0",
+    "unplugin-utils": "^0.3.1"
+  },
+  "devDependencies": {
+    "@antfu/eslint-config": "^9.0.0",
+    "@antfu/ni": "^30.1.0",
+    "@antfu/utils": "^9.3.0",
+    "@types/node": "^25.9.1",
+    "@unhead/vue": "^3.1.0",
+    "@vue/test-utils": "^2.4.10",
+    "bumpp": "^11.1.0",
+    "eslint": "^10.4.0",
+    "rollup": "^4.60.4",
+    "tsdown": "^0.22.0",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.13",
+    "vitest": "^4.1.6",
+    "vue": "^3.5.34",
+    "webpack": "^5.106.2"
+  },
+  "inlinedDependencies": {
+    "@antfu/utils": "9.3.0",
+    "@types/estree": "1.0.8",
+    "rollup": "4.60.4"
+  },
+  "scripts": {
+    "dev": "tsdown --watch",
+    "example:dev": "pnpm -C examples/vite run dev",
+    "example:build": "pnpm -C examples/vite run build",
+    "build": "tsdown",
+    "test": "vitest",
+    "test:update": "vitest -u",
+    "lint": "eslint .",
+    "release": "bumpp"
+  }
+}

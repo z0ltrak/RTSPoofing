@@ -1,0 +1,13 @@
+import { HookableCore } from 'hookable';
+import { U as Unhead, C as ClientHeadHooks, c as CreateClientHeadOptions } from './unhead.71V9w6oU.js';
+import { aw as ResolvableHead } from './unhead.B8_fLxlB.js';
+
+interface ClientUnhead<T = ResolvableHead> extends Unhead<T, boolean> {
+    hooks: HookableCore<ClientHeadHooks>;
+    dirty: boolean;
+    invalidate: () => void;
+}
+declare function createHead<T = ResolvableHead>(options?: CreateClientHeadOptions): ClientUnhead<T>;
+
+export { createHead as c };
+export type { ClientUnhead as C };
