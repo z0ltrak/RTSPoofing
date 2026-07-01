@@ -236,24 +236,71 @@ layout: center
 transition: slide-left
 ---
 
-# ¿Que hacemos entonces?
-
-
-
-<v-click>
-<div class="mt-9 text-center text-xl text-gray-300">
-  Solución: conectar la víctima al proxy <span class="text-green-400 font-bold">manualmente</span>.<br/>
+# Spoiler: el Forti nos ayudó sin querer
+ 
+<div class="text-center text-gray-500 text-sm mb-4 italic">
+  Fuimos a la red corporativa esperando un desastre. Encontramos un aliado inesperado.
 </div>
-<div class="text-center">
-  <span class="text-gray-500 text-base mt-2 block">Para la demo funciona igual de bien. Y no me voy a arriesgar a que nos llamen otra vez del SOC.</span>
+<div class="grid grid-cols-2 gap-8 mt-2 text-left text-sm">
+<div>
+**Lo que esperábamos:**
+<div class="text-gray-400 mt-1 mb-3">DAI activo → ARP falso descartado → ataque muerto </div>
+**Lo que realmente pasó:**
+<div class="text-gray-400 mt-1">El switch no bloqueó nada. Detectó que la misma IP apareció en otro puerto y actualizó la tabla MAC. Porque eso es lo que hacen los switches.</div>
+<div class="mt-3 bg-gray-900 rounded p-3 font-mono text-xs">
+MAC 00:11:22:33:44:55 → puerto 5 (cámara)<br/>
+MAC 00:0c:29:31:23:67 → puerto 12 (nosotros)<br/>
+<span class="text-yellow-400">⚠ MAC FLAP detectado — actualizando tabla</span><br/>
+<span class="text-green-400">→ tráfico redirigido al puerto 12. Gracias. 👍</span>
 </div>
-</v-click>
-
-<v-click>
-  <div class="flex justify-center mt-4">
-  <img src="/gifs/SOC.jpg" class="rounded-lg" style="height:220px"/>
-  </div>
-</v-click>
+</div>
+<div v-click>
+**El efecto colateral:**
+<div class="text-green-400 font-bold mt-1">La conexión TCP entre cámara y NVR se cae sola.</div>
+<div class="text-gray-400 mt-1 mb-3">El NVR reconecta → pasa por el proxy → profit.</div>
+<div class="bg-gray-900 rounded p-3 text-center">
+  <div class="text-yellow-400 font-bold mb-1">El switch Cisco/Fortinet/Aruba:</div>
+  <div class="text-gray-300 italic text-sm">"Detecto una anomalía de seguridad.<br/>Voy a redirigir el tráfico al atacante<br/>para proteger la red."</div>
+  <div class="text-gray-500 text-xs mt-2">— comportamiento no intencionado pero muy agradecido</div>
+</div>
+</div>
+</div>
+---
+layout: center
+transition: zoom-out
+---
+ 
+# MAC Flapping: el switch como cómplice involuntario
+ 
+<div class="mt-4 text-center text-gray-400 text-sm mb-4">Paso a paso de lo que ocurre en la red corporativa</div>
+<div class="max-w-2xl mx-auto">
+<v-clicks>
+<div class="flex items-start gap-3 mb-3">
+  <div class="w-7 h-7 bg-red-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">1</div>
+  <div class="text-sm text-gray-300">Activamos ARP spoof: anunciamos <span class="text-yellow-400 font-mono">IP_CAM → MAC_ATACANTE</span> al NVR</div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="w-7 h-7 bg-orange-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">2</div>
+  <div class="text-sm text-gray-300">El switch ve la misma IP en dos puertos distintos → detecta <span class="text-yellow-400 font-bold">MAC flapping</span></div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="w-7 h-7 bg-yellow-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">3</div>
+  <div class="text-sm text-gray-300">El switch actualiza la tabla MAC: ahora la IP de la cámara apunta a <span class="text-green-400 font-bold">nuestro puerto</span></div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">4</div>
+  <div class="text-sm text-gray-300">El tráfico TCP entre NVR y cámara llega a nosotros → la <span class="text-red-400 font-bold">conexión se cae</span></div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="w-7 h-7 bg-green-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">5</div>
+  <div class="text-sm text-gray-300">El NVR detecta la caída y <span class="text-green-400 font-bold">reconecta automáticamente</span> → esta vez pasa por el proxy</div>
+</div>
+<div class="flex items-start gap-3">
+  <div class="w-7 h-7 bg-purple-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">6</div>
+  <div class="text-sm text-gray-300">El proxy acepta la conexión. <span class="text-yellow-400 font-bold">El switch hizo nuestro trabajo.</span> 🤝</div>
+</div>
+</v-clicks>
+</div>
 
 ---
 layout: default
