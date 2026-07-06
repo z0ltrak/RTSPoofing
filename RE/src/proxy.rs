@@ -310,17 +310,7 @@ impl MITMSession {
                             inject_ts  = inject_ts.wrapping_add(ts_per_frame);
 
                             // Pacing
-                            let elapsed_ns = t0.elapsed().as_nanos() as u64;
-                            if elapsed_ns < interval_ns {
-                                let remaining = Duration::from_nanos(interval_ns - elapsed_ns);
-                                if remaining > Duration::from_micros(500) {
-                                    sleep(remaining - Duration::from_micros(500)).await;
-                                }
-                                let deadline = t0 + Duration::from_nanos(interval_ns);
-                                while Instant::now() < deadline {
-                                    tokio::task::yield_now().await;
-                                }
-                            }
+                            tokio::task::yield_now().await;
                         } => {}
                     }
                 }
