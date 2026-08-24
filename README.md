@@ -35,7 +35,9 @@ RTSPoofing/
 │   │   ├── capture.rs     # .rtp file I/O
 │   │   ├── parser.rs      # RTSP interleaved stream parser
 │   │   ├── rtp_probe.rs   # Real-time RTP parameter detection
-│   │   └── rtcp.rs        # Synthetic RTCP Sender Report generation
+│   │   ├── rtcp.rs        # Synthetic RTCP Sender Report generation
+│   │   ├── rtsp.rs        # SETUP message scanning + Transport header rewriting
+│   │   └── udp_relay.rs   # UDP socket pairs for one media track's transport
 │   ├── Cargo.toml         # Rust dependencies
 │   └── target/release/    # Compiled binary
 │
@@ -69,6 +71,17 @@ Available through `--mode inject`.
   (RTP channel + 1, per the usual `interleaved=X-Y` convention), so the wall-clock
   metadata a VMS/forensic tool would read also says "now" instead of going stale
   or silent once the real camera's RTCP stops flowing. See `--rtcp-sr-interval` below.
+
+### Transport Support
+
+RTSPoofing handles both transports RTSP actually negotiates, auto-detected per
+session from the SETUP request — no flag needed:
+
+- **TCP-interleaved** (`Transport: RTP/AVP/TCP;interleaved=X-Y`) — media is
+  `$`-framed inside the same TCP connection as the RTSP control channel.
+- **UDP** (`Transport: RTP/AVP;unicast;client_port=X-Y`) — media flows as
+  independent datagrams. See "UDP Transport" under How It Works for how this
+  works without ARP-spoofed traffic just being kernel-forwarded past the proxy.
 
 ### ARP Spoofing Support
 
@@ -265,6 +278,41 @@ channel implied by RFC 2326's `interleaved=X-Y` convention (RTCP channel = RTP c
 Set `--rtcp-sr-interval 0` to disable it; the RTP-level replay works identically either way.
 Note the on-screen OSD timestamp some cameras burn into the picture itself is a separate,
 arguably more consequential piece of "time" — this only spoofs the RTCP metadata layer.
+
+### UDP Transport
+
+With ARP spoofing and `ip_forward=1` already in the lab workflow, UDP RTP/RTCP
+between camera and NVR would normally just get transparently IP-forwarded by
+the kernel — without ever reaching this proxy's code, which defeats the whole
+point (recording/injecting requires the datagrams to actually pass through
+our process). So instead of relying on that, RTSPoofing rewrites the Transport
+header while relaying the SETUP request/response that's already flowing
+through the (already-intercepted) RTSP TCP connection:
+
+1. NVR sends `SETUP ... Transport: RTP/AVP;unicast;client_port=A-B` (its real
+   ports). The proxy binds two of its own UDP sockets, stashes the NVR's real
+   ports, and rewrites the request so the camera is told `client_port=` those
+   proxy-owned ports instead — the camera now unknowingly sends its RTP/RTCP
+   to us.
+2. Camera replies with its own `server_port=C-D`. The proxy binds two more UDP
+   sockets, rewrites the response's `client_port=` back to the NVR's real A-B
+   (so the NVR isn't confused seeing its own ports echoed differently) and its
+   `server_port=` to *another* pair of proxy-owned ports — the NVR now
+   unknowingly sends its RTCP receiver reports to us too, instead of straight
+   to the camera.
+3. From there it's four sockets per track: two the camera was told about
+   (receiving its real RTP/RTCP), two the NVR was told about (receiving its
+   RTCP reports, and used as the *source* when relaying/injecting media
+   toward the NVR — some implementations validate that incoming RTP/RTCP
+   actually comes from the declared server_port).
+
+Record and inject work identically to the TCP-interleaved path from there —
+same `.rtp` capture format, same `RTPProbe` auto-detection, same fixed-interval
+pacing, same synthetic RTCP SR — `process_camera_frame` in `proxy.rs` is the
+shared logic both transports call into. One session is treated as either
+fully TCP-interleaved or fully UDP (decided by the first SETUP seen); proxy
+UDP ports are OS-assigned ephemeral, and the RTSP parsing here is intentionally
+scoped to finding CSeq/Transport in SETUP messages, not a full RFC 2326 parser.
 
 ### Auto-Parameter Detection
 

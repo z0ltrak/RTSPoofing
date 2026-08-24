@@ -1,10 +1,15 @@
 //! proxy.rs — Async MITM proxy core.
 //!
-//! One MITMSession is spawned per accepted TCP connection.
+//! One MITMSession is spawned per accepted TCP connection. Handles both RTSP
+//! transports: TCP-interleaved (`$`-framed media inside the RTSP TCP
+//! connection) and UDP (media as independent datagrams on negotiated ports,
+//! set up by rewriting SETUP request/response Transport headers — see
+//! `rtsp.rs` and `udp_relay.rs`).
 
 use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::io::{BufWriter, Write};
@@ -21,6 +26,8 @@ use crate::capture::{write_frame, CapturedFrame};
 use crate::parser::{InterleavedParser, ParsedChunk};
 use crate::rtcp::{build_sr, ntp_now, rtcp_channel_for};
 use crate::rtp_probe::{RTPProbe, rtp_rewrite, build_interleaved, parse_rtp_header};
+use crate::rtsp::RtspTextScanner;
+use crate::udp_relay::{bind_udp_pair, PendingUdpTrack, UdpTrack};
 
 const CHUNK: usize = 65_536;
 
@@ -31,6 +38,7 @@ const CHUNK: usize = 65_536;
 #[derive(Debug, Clone)]
 pub struct ProxyConfig {
     pub mode:           Mode,
+    pub bind:           String,       // interface the proxy's own sockets (TCP listener, UDP relay ports) use
     pub camera_host:    String,
     pub camera_port:    u16,
     pub capture_file:   PathBuf,
@@ -90,6 +98,204 @@ struct RtcpTrack {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Shared per-session UDP transport state
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// A SETUP request has been seen and rewritten, and sockets are bound, but we're
+/// still waiting for the camera's SETUP response to learn its real media ports.
+type PendingSetups = Arc<Mutex<HashMap<String, PendingUdpTrack>>>; // keyed by CSeq
+/// Finalized tracks, ready to relay/inject through, keyed by our internal channel id.
+type UdpTracks = Arc<Mutex<HashMap<u8, Arc<UdpTrack>>>>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Shared frame handling — used by both the TCP-interleaved and UDP paths so
+// they can't drift apart.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Handles one media frame received from the camera, regardless of transport:
+/// feeds the auto-detect probe (firing injection readiness once it completes),
+/// updates the live seq/ts the injector continues from, and captures to disk
+/// in Record mode. Returns whether the frame should also be forwarded live to
+/// the NVR (false when `--inject-only` is suppressing the real stream).
+#[allow(clippy::too_many_arguments)]
+async fn process_camera_frame(
+    cfg:          &ProxyConfig,
+    probe:        &mut Option<RTPProbe>,
+    inject_fired: &mut bool,
+    inject_state: &Mutex<InjectState>,
+    inject_ready: &Notify,
+    cap_tx:       &Option<mpsc::Sender<CapMsg>>,
+    stats:        &Stats,
+    channel:      u8,
+    payload:      &[u8],
+) -> bool {
+    if let Some(p) = probe.as_mut() {
+        if !*inject_fired {
+            let just_ready = p.feed(channel, payload);
+            if just_ready {
+                if let Some(params) = p.params() {
+                    let mut st = inject_state.lock().await;
+                    st.inject_fps   = params.fps;
+                    st.inject_ssrc  = cfg.inject_ssrc.or(Some(params.ssrc));
+                    st.ts_per_frame = params.ts_per_frame();
+                    info!("Probe ready → FPS={:.2} SSRC={} PT={}",
+                          params.fps, params.ssrc_hex(), params.pt);
+                }
+                inject_ready.notify_waiters();
+                *inject_fired = true;
+            }
+        }
+    }
+
+    if let Some(hdr) = parse_rtp_header(payload) {
+        let mut st = inject_state.lock().await;
+        st.last_live_seq = hdr.seq;
+        st.last_live_ts  = hdr.ts;
+    }
+
+    if let Some(tx) = cap_tx {
+        let limit = cfg.capture_frames;
+        let already = stats.captured.load(Ordering::Relaxed);
+        if limit == 0 || already < limit {
+            if tx.try_send(CapMsg::Frame(channel, payload.to_vec())).is_err() {
+                warn!("Capture channel full — dropped one frame from the .rtp file (live stream unaffected)");
+            }
+            let now = stats.captured.fetch_add(1, Ordering::Relaxed) + 1;
+            if limit > 0 && now == limit {
+                info!("Capture limit {} reached — stopping capture (still forwarding live stream).", limit);
+                let _ = tx.try_send(CapMsg::Flush);
+            }
+        }
+    }
+
+    !cfg.inject_only
+}
+
+/// Bind a fresh track's four sockets and stash it as pending, given the NVR's
+/// real (pre-rewrite) client_port from its SETUP request.
+async fn handle_setup_request(
+    cfg: &ProxyConfig,
+    next_channel: &AtomicU8,
+    nvr_ip: IpAddr,
+    nvr_client_port: (u16, u16),
+) -> Result<(u8, (u16, u16), PendingUdpTrack)> {
+    let (cam_rtp, cam_rtcp) = bind_udp_pair(&cfg.bind).await?;
+    let (nvr_rtp, nvr_rtcp) = bind_udp_pair(&cfg.bind).await?;
+    let cam_ports = (cam_rtp.local_addr()?.port(), cam_rtcp.local_addr()?.port());
+    let channel = next_channel.fetch_add(2, Ordering::Relaxed);
+
+    let pending = PendingUdpTrack {
+        channel,
+        cam_facing_rtp:  cam_rtp,
+        cam_facing_rtcp: cam_rtcp,
+        nvr_facing_rtp:  nvr_rtp,
+        nvr_facing_rtcp: nvr_rtcp,
+        nvr_addr_rtp:  SocketAddr::new(nvr_ip, nvr_client_port.0),
+        nvr_addr_rtcp: SocketAddr::new(nvr_ip, nvr_client_port.1),
+    };
+    Ok((channel, cam_ports, pending))
+}
+
+/// Spawn the three relay tasks for a finalized UDP track: camera→NVR RTP (with
+/// the same probe/capture/forward handling the TCP-interleaved path uses),
+/// camera→NVR RTCP passthrough, and NVR→camera RTCP receiver reports.
+#[allow(clippy::too_many_arguments)]
+fn spawn_udp_track_relay(
+    track:        Arc<UdpTrack>,
+    cfg:          Arc<ProxyConfig>,
+    inject_state: Arc<Mutex<InjectState>>,
+    inject_ready: Arc<Notify>,
+    cap_tx:       Option<mpsc::Sender<CapMsg>>,
+    stats:        Arc<Stats>,
+    stop:         Arc<Notify>,
+) {
+    // camera → NVR: RTP (probe / capture / forward, same as the TCP path)
+    {
+        let track = track.clone();
+        let cfg = cfg.clone();
+        let inject_state = inject_state.clone();
+        let inject_ready = inject_ready.clone();
+        let cap_tx = cap_tx.clone();
+        let stats = stats.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; CHUNK];
+            let mut probe = if cfg.mode == Mode::Inject {
+                Some(RTPProbe::new(cfg.inject_delay, 30))
+            } else {
+                None
+            };
+            let mut inject_fired = false;
+
+            loop {
+                let n = tokio::select! {
+                    r = track.cam_facing_rtp.recv_from(&mut buf) => match r {
+                        Ok((n, _src)) => n,
+                        Err(_) => { stop.notify_waiters(); break; }
+                    },
+                    _ = stop.notified() => break,
+                };
+                stats.up_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                let payload = &buf[..n];
+
+                let should_forward = process_camera_frame(
+                    &cfg, &mut probe, &mut inject_fired,
+                    &inject_state, &inject_ready, &cap_tx, &stats,
+                    track.channel, payload,
+                ).await;
+
+                if should_forward {
+                    let _ = track.nvr_facing_rtp.send_to(payload, track.nvr_addr_rtp).await;
+                }
+            }
+        });
+    }
+
+    // camera → NVR: RTCP (SR passthrough — suppressed in --inject-only, where
+    // the injection task's own synthetic SR takes its place)
+    {
+        let track = track.clone();
+        let cfg = cfg.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let n = tokio::select! {
+                    r = track.cam_facing_rtcp.recv_from(&mut buf) => match r {
+                        Ok((n, _src)) => n,
+                        Err(_) => { stop.notify_waiters(); break; }
+                    },
+                    _ = stop.notified() => break,
+                };
+                if !cfg.inject_only {
+                    let _ = track.nvr_facing_rtcp.send_to(&buf[..n], track.nvr_addr_rtcp).await;
+                }
+            }
+        });
+    }
+
+    // NVR → camera: RTCP receiver reports, so a real camera's stream doesn't
+    // stall waiting for reports that never arrive.
+    {
+        let track = track.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let n = tokio::select! {
+                    r = track.nvr_facing_rtcp.recv_from(&mut buf) => match r {
+                        Ok((n, _src)) => n,
+                        Err(_) => { stop.notify_waiters(); break; }
+                    },
+                    _ = stop.notified() => break,
+                };
+                let _ = track.cam_facing_rtcp.send_to(&buf[..n], track.camera_addr_rtcp).await;
+            }
+        });
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // MITMSession
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -116,6 +322,9 @@ impl MITMSession {
 
         info!("MITM tunnel open: client↔proxy↔camera({})", camera_addr);
 
+        let nvr_ip    = client.peer_addr()?.ip();
+        let camera_ip = camera.peer_addr()?.ip();
+
         let (mut cr, cw) = tokio::io::split(client);
         let (mut ur, mut uw) = tokio::io::split(camera);
 
@@ -128,6 +337,14 @@ impl MITMSession {
         let inject_ready  = Arc::new(Notify::new());
         let stats         = Arc::new(Stats::default());
         let stop          = Arc::new(Notify::new());
+
+        // UDP-transport bookkeeping. Stays empty/unused for TCP-interleaved
+        // sessions — nothing here ever fires unless a SETUP request explicitly
+        // negotiates UDP, so the existing TCP-interleaved path is unaffected.
+        let pending_setups: PendingSetups = Arc::new(Mutex::new(HashMap::new()));
+        let udp_tracks: UdpTracks = Arc::new(Mutex::new(HashMap::new()));
+        let next_channel = Arc::new(AtomicU8::new(0));
+        let is_udp_session = Arc::new(AtomicBool::new(false));
 
         // Time-based warm-up fallback: fires injection after `inject_delay` regardless of
         // whether the camera is producing data. Without a dedicated timer, this check only
@@ -149,33 +366,59 @@ impl MITMSession {
         // ── Downstream relay: NVR → camera ────────────────────────────────
         let stop_d  = stop.clone();
         let stats_d = stats.clone();
+        let cfg_d   = self.cfg.clone();
+        let pending_d = pending_setups.clone();
+        let next_channel_d = next_channel.clone();
+        let is_udp_d = is_udp_session.clone();
         let down_task = tokio::spawn(async move {
             let mut buf = vec![0u8; CHUNK];
+            let mut scanner = RtspTextScanner::new();
             loop {
-                tokio::select! {
-                    result = cr.read(&mut buf) => {
-                        match result {
-                            Ok(0) | Err(_) => { stop_d.notify_waiters(); break; }
-                            Ok(n) => {
-                                debug!("NVR→CAM {} bytes", n);
-                                if uw.write_all(&buf[..n]).await.is_err() {
-                                    stop_d.notify_waiters(); break;
-                                }
-                                stats_d.down_bytes.fetch_add(n as u64, Ordering::Relaxed);
+                let n = tokio::select! {
+                    r = cr.read(&mut buf) => match r {
+                        Ok(0) | Err(_) => { stop_d.notify_waiters(); break; }
+                        Ok(n) => n,
+                    },
+                    _ = stop_d.notified() => break,
+                };
+                stats_d.down_bytes.fetch_add(n as u64, Ordering::Relaxed);
+
+                for msg in scanner.feed(&buf[..n]) {
+                    let text = String::from_utf8_lossy(&msg).into_owned();
+                    let mut out = msg;
+
+                    if let Some(setup) = crate::rtsp::parse_setup_request(&text) {
+                        match handle_setup_request(&cfg_d, &next_channel_d, nvr_ip, setup.client_port).await {
+                            Ok((channel, cam_ports, pending)) => {
+                                pending_d.lock().await.insert(setup.cseq.clone(), pending);
+                                is_udp_d.store(true, Ordering::Relaxed);
+                                info!("SETUP (UDP) intercepted on channel {}: NVR asked for client_port={:?}, camera told client_port={:?}",
+                                      channel, setup.client_port, cam_ports);
+                                out = crate::rtsp::rewrite_port_pair(&text, "client_port=", cam_ports).into_bytes();
+                            }
+                            Err(e) => {
+                                warn!("Could not set up UDP relay for a SETUP request: {e} — forwarding unmodified; this track won't be recordable/injectable.");
                             }
                         }
                     }
-                    _ = stop_d.notified() => break,
+
+                    debug!("NVR→CAM {} bytes", out.len());
+                    if uw.write_all(&out).await.is_err() {
+                        stop_d.notify_waiters();
+                        return;
+                    }
                 }
             }
         });
 
         // ── Upstream relay: camera → NVR ──────────────────────────────────
-        let cfg_u         = self.cfg.clone();
+        let cfg_u          = self.cfg.clone();
         let inject_state_u = inject_state.clone();
         let inject_ready_u = inject_ready.clone();
-        let stats_u        = stats.clone();
-        let stop_u         = stop.clone();
+        let stats_u         = stats.clone();
+        let stop_u          = stop.clone();
+        let pending_u       = pending_setups.clone();
+        let udp_tracks_u    = udp_tracks.clone();
 
         // Capture writes happen on a dedicated blocking thread so a slow disk
         // never stalls the live CAM→NVR relay (which shares this task).
@@ -211,6 +454,7 @@ impl MITMSession {
         let up_task = tokio::spawn(async move {
             let mut buf    = vec![0u8; CHUNK];
             let mut parser = InterleavedParser::new();
+            let mut rtsp_scanner = RtspTextScanner::new();
             let mut probe  = if cfg_u.mode == Mode::Inject {
                 Some(RTPProbe::new(cfg_u.inject_delay, 30))
             } else {
@@ -236,52 +480,54 @@ impl MITMSession {
                 for chunk in chunks {
                     match chunk {
                         ParsedChunk::Text(text) => {
-                            if cw_up.lock().await.write_all(&text).await.is_err() {
-                                stop_u2.notify_waiters();
-                                return;
+                            for msg in rtsp_scanner.feed(&text) {
+                                let msg_text = String::from_utf8_lossy(&msg).into_owned();
+                                let mut out = msg;
+
+                                if let Some(resp) = crate::rtsp::parse_setup_response(&msg_text) {
+                                    let pending = pending_u.lock().await.remove(&resp.cseq);
+                                    if let Some(pending) = pending {
+                                        let channel = pending.channel;
+                                        let nvr_ports = (pending.nvr_addr_rtp.port(), pending.nvr_addr_rtcp.port());
+                                        // We must also redirect `server_port` to our own nvr-facing
+                                        // ports — otherwise the NVR would send its RTCP receiver
+                                        // reports straight to the real camera, bypassing the proxy.
+                                        let our_server_port = match (pending.nvr_facing_rtp.local_addr(), pending.nvr_facing_rtcp.local_addr()) {
+                                            (Ok(a), Ok(b)) => (a.port(), b.port()),
+                                            _ => (0, 0),
+                                        };
+                                        let camera_rtcp_addr = SocketAddr::new(camera_ip, resp.server_port.1);
+                                        let track = Arc::new(pending.finalize(camera_rtcp_addr));
+
+                                        udp_tracks_u.lock().await.insert(channel, track.clone());
+                                        info!("SETUP response (UDP) — camera server_port={:?}, NVR told server_port={:?} — UDP relay live on channel {}",
+                                              resp.server_port, our_server_port, channel);
+
+                                        spawn_udp_track_relay(
+                                            track, cfg_u.clone(), inject_state_u.clone(), inject_ready_u.clone(),
+                                            cap_u.clone(), stats_u.clone(), stop_u2.clone(),
+                                        );
+
+                                        let rewritten = crate::rtsp::rewrite_port_pair(&msg_text, "client_port=", nvr_ports);
+                                        let rewritten = crate::rtsp::rewrite_port_pair(&rewritten, "server_port=", our_server_port);
+                                        out = rewritten.into_bytes();
+                                    }
+                                }
+
+                                if cw_up.lock().await.write_all(&out).await.is_err() {
+                                    stop_u2.notify_waiters();
+                                    return;
+                                }
                             }
                         }
                         ParsedChunk::Frame(channel, payload) => {
-                            if let Some(p) = probe.as_mut() {
-                                if !inject_fired {
-                                    let just_ready = p.feed(channel, &payload);
-                                    if just_ready {
-                                        if let Some(params) = p.params() {
-                                            let mut st = inject_state_u.lock().await;
-                                            st.inject_fps   = params.fps;
-                                            st.inject_ssrc  = cfg_u.inject_ssrc.or(Some(params.ssrc));
-                                            st.ts_per_frame = params.ts_per_frame();
-                                            info!("Probe ready → FPS={:.2} SSRC={} PT={}",
-                                                  params.fps, params.ssrc_hex(), params.pt);
-                                        }
-                                        inject_ready_u.notify_waiters();
-                                        inject_fired = true;
-                                    }
-                                }
-                            }
+                            let should_forward = process_camera_frame(
+                                &cfg_u, &mut probe, &mut inject_fired,
+                                &inject_state_u, &inject_ready_u, &cap_u, &stats_u,
+                                channel, &payload,
+                            ).await;
 
-                            if let Some(hdr) = parse_rtp_header(&payload) {
-                                let mut st = inject_state_u.lock().await;
-                                st.last_live_seq = hdr.seq;
-                                st.last_live_ts  = hdr.ts;
-                            }
-
-                            if let Some(tx) = &cap_u {
-                                let limit = cfg_u.capture_frames;
-                                let already = stats_u.captured.load(Ordering::Relaxed);
-                                if limit == 0 || already < limit {
-                                    if tx.try_send(CapMsg::Frame(channel, payload.clone())).is_err() {
-                                        warn!("Capture channel full — dropped one frame from the .rtp file (live stream unaffected)");
-                                    }
-                                    let now = stats_u.captured.fetch_add(1, Ordering::Relaxed) + 1;
-                                    if limit > 0 && now == limit {
-                                        info!("Capture limit {} reached — stopping capture (still forwarding live stream).", limit);
-                                        let _ = tx.try_send(CapMsg::Flush);
-                                    }
-                                }
-                            }
-
-                            if !cfg_u.inject_only {
+                            if should_forward {
                                 let wire = build_interleaved(channel, &payload);
                                 if cw_up.lock().await.write_all(&wire).await.is_err() {
                                     stop_u2.notify_waiters();
@@ -307,6 +553,8 @@ impl MITMSession {
             let stop_i    = stop.clone();
             let ready_i   = inject_ready.clone();
             let cfg_i     = self.cfg.clone();
+            let udp_tracks_i = udp_tracks.clone();
+            let is_udp_i     = is_udp_session.clone();
 
             Some(tokio::spawn(async move {
                 info!("Injection task started — waiting for warm-up signal.");
@@ -355,29 +603,42 @@ impl MITMSession {
                             idx += 1;
 
                             let new_payload = rtp_rewrite(&frame.payload, inject_seq, inject_ts, inject_ssrc);
-                            let wire = build_interleaved(frame.channel, &new_payload);
 
-                            {
+                            // UDP sessions: send raw RTP straight to the NVR's real client_port,
+                            // from the socket we declared as server_port. If this session is UDP
+                            // but the track isn't finalized yet (SETUP still in flight), skip this
+                            // tick's frame rather than risk writing $-framed bytes into what the
+                            // NVR still expects to be plain RTSP control text.
+                            let mut sent = false;
+                            if is_udp_i.load(Ordering::Relaxed) {
+                                if let Some(track) = udp_tracks_i.lock().await.get(&frame.channel) {
+                                    sent = track.nvr_facing_rtp.send_to(&new_payload, track.nvr_addr_rtp).await.is_ok();
+                                }
+                            } else {
+                                let wire = build_interleaved(frame.channel, &new_payload);
                                 let mut w = cw_i.lock().await;
                                 if w.write_all(&wire).await.is_err() {
                                     stop_i.notify_waiters();
                                     break;
                                 }
+                                sent = true;
                             }
 
-                            let injected = stats_i.injected.fetch_add(1, Ordering::Relaxed) + 1;
-                            if injected % 100 == 0 {
-                                debug!("Injected {} frames (seq={})", injected, inject_seq);
-                            }
+                            if sent {
+                                let injected = stats_i.injected.fetch_add(1, Ordering::Relaxed) + 1;
+                                if injected % 100 == 0 {
+                                    debug!("Injected {} frames (seq={})", injected, inject_seq);
+                                }
 
-                            if rtcp_enabled {
-                                let used_ssrc = parse_rtp_header(&new_payload).map(|h| h.ssrc).unwrap_or(0);
-                                let payload_bytes = new_payload.len().saturating_sub(12) as u32;
-                                let track = rtcp_tracks.entry(frame.channel).or_default();
-                                track.ssrc = used_ssrc;
-                                track.last_rtp_ts = inject_ts;
-                                track.pkt_count = track.pkt_count.wrapping_add(1);
-                                track.octet_count = track.octet_count.wrapping_add(payload_bytes);
+                                if rtcp_enabled {
+                                    let used_ssrc = parse_rtp_header(&new_payload).map(|h| h.ssrc).unwrap_or(0);
+                                    let payload_bytes = new_payload.len().saturating_sub(12) as u32;
+                                    let track = rtcp_tracks.entry(frame.channel).or_default();
+                                    track.ssrc = used_ssrc;
+                                    track.last_rtp_ts = inject_ts;
+                                    track.pkt_count = track.pkt_count.wrapping_add(1);
+                                    track.octet_count = track.octet_count.wrapping_add(payload_bytes);
+                                }
                             }
 
                             // Update seq/ts after send
@@ -386,14 +647,27 @@ impl MITMSession {
                         }
                         _ = rtcp_ticker.tick(), if rtcp_enabled => {
                             let (ntp_secs, ntp_frac) = ntp_now();
+                            let udp_snapshot = if is_udp_i.load(Ordering::Relaxed) {
+                                Some(udp_tracks_i.lock().await)
+                            } else {
+                                None
+                            };
                             for (&channel, track) in rtcp_tracks.iter() {
                                 let sr = build_sr(track.ssrc, ntp_secs, ntp_frac, track.last_rtp_ts,
                                                    track.pkt_count, track.octet_count);
-                                let wire = build_interleaved(rtcp_channel_for(channel), &sr);
-                                let mut w = cw_i.lock().await;
-                                if w.write_all(&wire).await.is_err() {
-                                    stop_i.notify_waiters();
-                                    break;
+                                match udp_snapshot.as_ref().and_then(|m| m.get(&channel)) {
+                                    Some(udp_track) => {
+                                        let _ = udp_track.nvr_facing_rtcp.send_to(&sr, udp_track.nvr_addr_rtcp).await;
+                                    }
+                                    None if !is_udp_i.load(Ordering::Relaxed) => {
+                                        let wire = build_interleaved(rtcp_channel_for(channel), &sr);
+                                        let mut w = cw_i.lock().await;
+                                        if w.write_all(&wire).await.is_err() {
+                                            stop_i.notify_waiters();
+                                            break;
+                                        }
+                                    }
+                                    None => {} // UDP session, track not finalized yet — skip this round
                                 }
                             }
                             debug!("Sent RTCP SR for {} channel(s), NTP={}.{}", rtcp_tracks.len(), ntp_secs, ntp_frac);

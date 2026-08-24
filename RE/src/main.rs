@@ -11,6 +11,8 @@ mod parser;
 mod proxy;
 mod rtcp;
 mod rtp_probe;
+mod rtsp;
+mod udp_relay;
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -189,6 +191,7 @@ async fn main() -> Result<()> {
 
     let cfg = Arc::new(ProxyConfig {
         mode:           mode.clone(),
+        bind:           cli.bind.clone(),
         camera_host:    cli.camera_host.clone(),
         camera_port:    cli.camera_port,
         capture_file:   cli.capture_file.clone(),
