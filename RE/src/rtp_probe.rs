@@ -339,3 +339,127 @@ impl RTPProbe {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn rtp_header_bytes(pt: u8, seq: u16, ts: u32, ssrc: u32, marker: bool) -> Vec<u8> {
+        let mut v = vec![0x80u8]; // V=2, P=0, X=0, CC=0
+        v.push(if marker { pt | 0x80 } else { pt & 0x7F });
+        v.extend_from_slice(&seq.to_be_bytes());
+        v.extend_from_slice(&ts.to_be_bytes());
+        v.extend_from_slice(&ssrc.to_be_bytes());
+        v
+    }
+
+    #[test]
+    fn parse_rtp_header_extracts_fields() {
+        let mut pkt = rtp_header_bytes(96, 1234, 90000, 0xDEADBEEF, true);
+        pkt.extend_from_slice(b"payload");
+        let hdr = parse_rtp_header(&pkt).expect("should parse");
+        assert_eq!(hdr.pt, 96);
+        assert_eq!(hdr.seq, 1234);
+        assert_eq!(hdr.ts, 90000);
+        assert_eq!(hdr.ssrc, 0xDEADBEEF);
+        assert!(hdr.marker);
+        assert_eq!(hdr.payload_offset, 12);
+    }
+
+    #[test]
+    fn parse_rtp_header_rejects_too_short() {
+        assert!(parse_rtp_header(&[0x80, 96, 0, 0]).is_none());
+    }
+
+    #[test]
+    fn parse_rtp_header_rejects_wrong_version() {
+        let mut pkt = rtp_header_bytes(96, 1, 1, 1, false);
+        pkt[0] = 0x00; // version 0, not RTP's version 2
+        assert!(parse_rtp_header(&pkt).is_none());
+    }
+
+    #[test]
+    fn parse_rtp_header_accounts_for_csrc_count() {
+        let mut pkt = vec![0x82u8, 96]; // CC=2
+        pkt.extend_from_slice(&1u16.to_be_bytes());
+        pkt.extend_from_slice(&2u32.to_be_bytes());
+        pkt.extend_from_slice(&3u32.to_be_bytes());
+        pkt.extend_from_slice(&[0u8; 8]); // 2 CSRC identifiers, 4 bytes each
+        pkt.extend_from_slice(b"data");
+        let hdr = parse_rtp_header(&pkt).expect("should parse");
+        assert_eq!(hdr.payload_offset, 12 + 2 * 4);
+    }
+
+    #[test]
+    fn rtp_rewrite_overwrites_seq_ts_ssrc_and_keeps_payload() {
+        let mut pkt = rtp_header_bytes(96, 1, 1, 0x11111111, false);
+        pkt.extend_from_slice(b"XYZ");
+        let out = rtp_rewrite(&pkt, 42, 900_000, Some(0x22222222));
+        let hdr = parse_rtp_header(&out).unwrap();
+        assert_eq!(hdr.seq, 42);
+        assert_eq!(hdr.ts, 900_000);
+        assert_eq!(hdr.ssrc, 0x22222222);
+        assert_eq!(&out[12..], b"XYZ");
+    }
+
+    #[test]
+    fn rtp_rewrite_keeps_original_ssrc_when_none() {
+        let pkt = rtp_header_bytes(96, 1, 1, 0xABCDEF01, false);
+        let out = rtp_rewrite(&pkt, 5, 5, None);
+        assert_eq!(parse_rtp_header(&out).unwrap().ssrc, 0xABCDEF01);
+    }
+
+    #[test]
+    fn build_interleaved_produces_correct_wire_format() {
+        let wire = build_interleaved(7, b"hello");
+        assert_eq!(wire[0], 0x24);
+        assert_eq!(wire[1], 7);
+        assert_eq!(u16::from_be_bytes([wire[2], wire[3]]), 5);
+        assert_eq!(&wire[4..], b"hello");
+    }
+
+    #[test]
+    fn probe_becomes_ready_and_picks_majority_pt_ssrc_channel() {
+        let mut probe = RTPProbe::new(Duration::from_millis(1), 5);
+        std::thread::sleep(Duration::from_millis(5));
+
+        let mut became_ready = false;
+        for i in 0..10u16 {
+            let pkt = rtp_header_bytes(96, i, (i as u32) * 3600, 0xCAFEBABE, false);
+            if probe.feed(0, &pkt) {
+                became_ready = true;
+            }
+        }
+        assert!(became_ready, "probe should have transitioned to ready");
+        let params = probe.params().expect("should have params once ready");
+        assert_eq!(params.pt, 96);
+        assert_eq!(params.ssrc, 0xCAFEBABE);
+        assert_eq!(params.channel, 0);
+    }
+
+    #[test]
+    fn probe_estimates_fps_from_timestamp_deltas() {
+        let mut probe = RTPProbe::new(Duration::from_millis(1), 15);
+        std::thread::sleep(Duration::from_millis(5));
+        // 3600 ticks/frame at the 90kHz RTP clock => 25fps. A real (if tiny) sleep
+        // between frames matters here: estimate_fps() filters out samples whose
+        // wall-clock gap is under 100us, so a tight zero-delay loop would starve it.
+        for i in 0..20u16 {
+            let pkt = rtp_header_bytes(96, i, (i as u32) * 3600, 0xAAAA, false);
+            probe.feed(0, &pkt);
+            std::thread::sleep(Duration::from_micros(500));
+        }
+        let params = probe.force_result();
+        assert!((params.fps - 25.0).abs() < 0.5, "expected ~25fps, got {}", params.fps);
+    }
+
+    #[test]
+    fn probe_detects_sequence_gaps() {
+        let mut probe = RTPProbe::new(Duration::from_secs(999), 999); // never auto-completes
+        probe.feed(0, &rtp_header_bytes(96, 1, 0, 1, false));
+        probe.feed(0, &rtp_header_bytes(96, 2, 3600, 1, false));
+        probe.feed(0, &rtp_header_bytes(96, 10, 7200, 1, false)); // jump = one gap
+        let params = probe.force_result();
+        assert_eq!(params.gaps, 1);
+    }
+}

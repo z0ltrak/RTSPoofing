@@ -158,3 +158,139 @@ pub fn rewrite_port_pair(msg: &str, key: &str, new_ports: (u16, u16)) -> String 
     out.push_str(&rest[end_offset..]);
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn setup_request(cseq: &str, client_port: &str) -> String {
+        format!(
+            "SETUP rtsp://192.168.1.10/track1 RTSP/1.0\r\nCSeq: {cseq}\r\n\
+             Transport: RTP/AVP;unicast;client_port={client_port}\r\n\r\n"
+        )
+    }
+
+    #[test]
+    fn parses_udp_setup_request() {
+        let msg = setup_request("2", "8000-8001");
+        let req = parse_setup_request(&msg).expect("should parse");
+        assert_eq!(req.cseq, "2");
+        assert_eq!(req.client_port, (8000, 8001));
+    }
+
+    #[test]
+    fn rejects_tcp_interleaved_setup_request() {
+        let msg = "SETUP rtsp://x/track1 RTSP/1.0\r\nCSeq: 1\r\n\
+                   Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n";
+        assert!(parse_setup_request(msg).is_none());
+    }
+
+    #[test]
+    fn rejects_non_setup_requests() {
+        let play = "PLAY rtsp://x/track1 RTSP/1.0\r\nCSeq: 3\r\n\r\n";
+        assert!(parse_setup_request(play).is_none());
+        let describe = "DESCRIBE rtsp://x RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+        assert!(parse_setup_request(describe).is_none());
+    }
+
+    #[test]
+    fn parses_setup_response() {
+        let msg = "RTSP/1.0 200 OK\r\nCSeq: 2\r\n\
+                   Transport: RTP/AVP;unicast;client_port=8000-8001;server_port=9000-9001\r\n\r\n";
+        let resp = parse_setup_response(msg).expect("should parse");
+        assert_eq!(resp.cseq, "2");
+        assert_eq!(resp.server_port, (9000, 9001));
+    }
+
+    #[test]
+    fn rejects_non_2xx_setup_response() {
+        let msg = "RTSP/1.0 461 Unsupported Transport\r\nCSeq: 2\r\n\r\n";
+        assert!(parse_setup_response(msg).is_none());
+    }
+
+    #[test]
+    fn rewrite_port_pair_substitutes_only_that_field() {
+        let msg = "Transport: RTP/AVP;unicast;client_port=8000-8001;mode=play\r\n";
+        let out = rewrite_port_pair(msg, "client_port=", (54321, 54322));
+        assert_eq!(out, "Transport: RTP/AVP;unicast;client_port=54321-54322;mode=play\r\n");
+    }
+
+    #[test]
+    fn rewrite_port_pair_handles_different_digit_counts() {
+        // 4-digit -> 5-digit ports must not corrupt whatever follows.
+        let msg = "client_port=8000-8001;next=1\r\n";
+        let out = rewrite_port_pair(msg, "client_port=", (60123, 60124));
+        assert_eq!(out, "client_port=60123-60124;next=1\r\n");
+    }
+
+    #[test]
+    fn rewrite_port_pair_leaves_message_unchanged_if_key_absent() {
+        let msg = "Transport: RTP/AVP/TCP;interleaved=0-1\r\n";
+        let out = rewrite_port_pair(msg, "client_port=", (1, 2));
+        assert_eq!(out, msg);
+    }
+
+    #[test]
+    fn scanner_yields_one_message_fed_all_at_once() {
+        let mut scanner = RtspTextScanner::new();
+        let msg = setup_request("1", "1000-1001");
+        let out = scanner.feed(msg.as_bytes());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], msg.as_bytes());
+    }
+
+    #[test]
+    fn scanner_reassembles_a_message_split_across_feeds() {
+        let mut scanner = RtspTextScanner::new();
+        let msg = setup_request("1", "1000-1001");
+        let bytes = msg.as_bytes();
+        let mid = bytes.len() / 2;
+
+        let out1 = scanner.feed(&bytes[..mid]);
+        assert!(out1.is_empty(), "message isn't complete yet");
+
+        let out2 = scanner.feed(&bytes[mid..]);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0], bytes);
+    }
+
+    #[test]
+    fn scanner_waits_for_full_content_length_body() {
+        let mut scanner = RtspTextScanner::new();
+        let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\n";
+        let msg = format!(
+            "RTSP/1.0 200 OK\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(), body
+        );
+        let bytes = msg.as_bytes();
+        let header_end = bytes.len() - body.len();
+
+        let out1 = scanner.feed(&bytes[..header_end]);
+        assert!(out1.is_empty(), "should wait for the Content-Length body before emitting");
+
+        let out2 = scanner.feed(&bytes[header_end..]);
+        assert_eq!(out2.len(), 1);
+        assert_eq!(out2[0], bytes);
+    }
+
+    #[test]
+    fn scanner_handles_back_to_back_messages_in_one_feed() {
+        let mut scanner = RtspTextScanner::new();
+        let msg1 = setup_request("1", "1000-1001");
+        let msg2 = setup_request("2", "2000-2001");
+        let combined = format!("{msg1}{msg2}");
+        let out = scanner.feed(combined.as_bytes());
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0], msg1.as_bytes());
+        assert_eq!(out[1], msg2.as_bytes());
+    }
+
+    #[test]
+    fn scanner_flushes_oversized_unterminated_buffer_instead_of_growing_forever() {
+        let mut scanner = RtspTextScanner::new();
+        let junk = vec![b'A'; MAX_RTSP_MSG + 100]; // no \r\n\r\n anywhere
+        let out = scanner.feed(&junk);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].len(), junk.len());
+    }
+}

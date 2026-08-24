@@ -336,6 +336,22 @@ These parameters are then used for smoother injection and stream continuity.
 - `--capture-frames` now actually stops writing to disk once the limit is reached (the live
   relay keeps running); previously the limit was logged but never enforced.
 
+## Running the Rust Test Suite
+
+```bash
+cd RE
+cargo test --release
+```
+
+Unit tests live alongside the code they cover (`#[cfg(test)] mod tests` in each
+file — standard practice for a binary crate with no separate `lib.rs`), and are
+scoped to the pure/deterministic logic: the interleaved-frame parser, RTP
+header parsing/rewriting, RTCP SR construction, SETUP message scanning and
+Transport-header rewriting, and the `.rtp` capture file format (including a
+real write-then-read round trip through a temp file). They don't cover the
+async networking in `proxy.rs`/`udp_relay.rs` directly — that's exercised by
+end-to-end runs against a real or simulated camera/NVR instead.
+
 ## Testing the Python Prototype
 
 The original Python prototype, located at `PE/RTSPoofing.py`, can be used for quick experiments:

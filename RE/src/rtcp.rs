@@ -58,3 +58,46 @@ pub fn build_sr(ssrc: u32, ntp_secs: u32, ntp_frac: u32, rtp_ts: u32, pkt_count:
     out.extend_from_slice(&octet_count.to_be_bytes());
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtcp_channel_for_uses_next_odd_channel() {
+        assert_eq!(rtcp_channel_for(0), 1);
+        assert_eq!(rtcp_channel_for(2), 3);
+        assert_eq!(rtcp_channel_for(254), 255);
+    }
+
+    #[test]
+    fn rtcp_channel_for_odd_input_returns_itself() {
+        // Not a real-world input (RTP channels are conventionally even), but
+        // the function must degrade sanely rather than panic or overflow.
+        assert_eq!(rtcp_channel_for(1), 1);
+    }
+
+    #[test]
+    fn build_sr_produces_correct_28_byte_layout() {
+        let sr = build_sr(0xC0FFEE01, 0x11111111, 0x22222222, 0x33333333, 100, 5000);
+        assert_eq!(sr.len(), 28);
+        assert_eq!(sr[0] >> 6, 2, "RTCP version must be 2");
+        assert_eq!(sr[1], 200, "packet type must be SR (200)");
+        assert_eq!(u16::from_be_bytes([sr[2], sr[3]]), 6, "length field must be 6 words");
+        assert_eq!(u32::from_be_bytes(sr[4..8].try_into().unwrap()), 0xC0FFEE01, "ssrc");
+        assert_eq!(u32::from_be_bytes(sr[8..12].try_into().unwrap()), 0x11111111, "ntp seconds");
+        assert_eq!(u32::from_be_bytes(sr[12..16].try_into().unwrap()), 0x22222222, "ntp fraction");
+        assert_eq!(u32::from_be_bytes(sr[16..20].try_into().unwrap()), 0x33333333, "rtp timestamp");
+        assert_eq!(u32::from_be_bytes(sr[20..24].try_into().unwrap()), 100, "packet count");
+        assert_eq!(u32::from_be_bytes(sr[24..28].try_into().unwrap()), 5000, "octet count");
+    }
+
+    #[test]
+    fn ntp_now_is_in_a_plausible_current_range() {
+        let (secs, _frac) = ntp_now();
+        let unix_secs = secs as u64 - NTP_UNIX_EPOCH_OFFSET;
+        // Anywhere between 2020-01-01 and 2100-01-01 in Unix time.
+        assert!(unix_secs > 1_577_836_800, "NTP timestamp looks too far in the past");
+        assert!(unix_secs < 4_102_444_800, "NTP timestamp looks implausibly far in the future");
+    }
+}

@@ -119,3 +119,77 @@ pub fn read_capture_file(path: &Path) -> Result<(Vec<CapturedFrame>, CapturePara
 
     Ok((frames, params))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    fn sample_rtp(seq: u16, ts: u32, ssrc: u32) -> Vec<u8> {
+        let mut v = vec![0x80u8, 96]; // V=2, PT=96 (H264)
+        v.extend_from_slice(&seq.to_be_bytes());
+        v.extend_from_slice(&ts.to_be_bytes());
+        v.extend_from_slice(&ssrc.to_be_bytes());
+        v.extend_from_slice(b"payload-data");
+        v
+    }
+
+    #[test]
+    fn write_frame_produces_correct_header() {
+        let mut buf = Cursor::new(Vec::new());
+        let payload = b"hello world";
+        write_frame(&mut buf, 3, payload).unwrap();
+        let data = buf.into_inner();
+
+        let total_len = u32::from_be_bytes(data[0..4].try_into().unwrap());
+        assert_eq!(total_len, 4 + payload.len() as u32);
+        assert_eq!(data[4], 3, "channel");
+        assert_eq!(data[5], 0, "reserved byte must be zero");
+        let rtp_len = u16::from_be_bytes(data[6..8].try_into().unwrap());
+        assert_eq!(rtp_len as usize, payload.len());
+        assert_eq!(&data[8..], payload);
+    }
+
+    #[test]
+    fn round_trip_through_a_real_file() {
+        let path = std::env::temp_dir().join(format!(
+            "rtspoofing_test_{}_{}.rtp",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos(),
+        ));
+
+        let frames_in = [
+            sample_rtp(0, 0, 0xC0FFEE01),
+            sample_rtp(1, 3600, 0xC0FFEE01),
+            sample_rtp(2, 7200, 0xC0FFEE01),
+        ];
+
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            for (i, rtp) in frames_in.iter().enumerate() {
+                write_frame(&mut f, (i % 2) as u8, rtp).unwrap();
+            }
+        }
+
+        let result = read_capture_file(&path);
+        std::fs::remove_file(&path).ok();
+        let (frames_out, params) = result.unwrap();
+
+        assert_eq!(frames_out.len(), 3);
+        for (i, f) in frames_out.iter().enumerate() {
+            assert_eq!(f.channel, (i % 2) as u8);
+            assert_eq!(f.payload, frames_in[i]);
+        }
+
+        assert_eq!(params.pt, 96);
+        assert_eq!(params.ssrc, 0xC0FFEE01);
+        assert_eq!(params.codec_name, "H264");
+        assert!(params.fps > 0.0, "should estimate a positive fps from the timestamps");
+    }
+
+    #[test]
+    fn read_capture_file_missing_path_errors_instead_of_panicking() {
+        let path = std::env::temp_dir().join("rtspoofing_definitely_does_not_exist.rtp");
+        assert!(read_capture_file(&path).is_err());
+    }
+}
