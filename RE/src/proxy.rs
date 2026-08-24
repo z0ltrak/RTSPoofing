@@ -2,7 +2,9 @@
 //!
 //! One MITMSession is spawned per accepted TCP connection.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use std::io::{BufWriter, Write};
@@ -10,13 +12,14 @@ use std::fs::OpenOptions;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio::sync::{Mutex, Notify};
-use tokio::time::{sleep, Instant};
-use tracing::{debug, info, error};
+use tokio::sync::{mpsc, Mutex, Notify};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, error, warn};
 use anyhow::Result;
 
 use crate::capture::{write_frame, CapturedFrame};
 use crate::parser::{InterleavedParser, ParsedChunk};
+use crate::rtcp::{build_sr, ntp_now, rtcp_channel_for};
 use crate::rtp_probe::{RTPProbe, rtp_rewrite, build_interleaved, parse_rtp_header};
 
 const CHUNK: usize = 65_536;
@@ -36,6 +39,7 @@ pub struct ProxyConfig {
     pub inject_fps:     f64,
     pub inject_ssrc:    Option<u32>,
     pub inject_only:    bool,
+    pub rtcp_sr_interval: Duration,   // 0 disables RTCP SR generation
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -60,10 +64,29 @@ pub struct InjectState {
 
 #[derive(Debug, Default)]
 struct Stats {
-    up_bytes:   u64,
-    down_bytes: u64,
-    captured:   usize,
-    injected:   usize,
+    up_bytes:   AtomicU64,
+    down_bytes: AtomicU64,
+    captured:   AtomicUsize,
+    injected:   AtomicUsize,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Capture writer — off the hot relay path
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Messages sent to the dedicated blocking capture-writer task.
+enum CapMsg {
+    Frame(u8, Vec<u8>),
+    Flush,
+}
+
+/// Running totals for one injected media channel's synthetic RTCP Sender Reports.
+#[derive(Default)]
+struct RtcpTrack {
+    ssrc:        u32,
+    last_rtp_ts: u32,
+    pkt_count:   u32,
+    octet_count: u32,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -93,7 +116,7 @@ impl MITMSession {
 
         info!("MITM tunnel open: client↔proxy↔camera({})", camera_addr);
 
-        let (mut cr, mut cw) = tokio::io::split(client);
+        let (mut cr, cw) = tokio::io::split(client);
         let (mut ur, mut uw) = tokio::io::split(camera);
 
         let inject_state  = Arc::new(Mutex::new(InjectState {
@@ -103,8 +126,25 @@ impl MITMSession {
             ..Default::default()
         }));
         let inject_ready  = Arc::new(Notify::new());
-        let stats         = Arc::new(Mutex::new(Stats::default()));
+        let stats         = Arc::new(Stats::default());
         let stop          = Arc::new(Notify::new());
+
+        // Time-based warm-up fallback: fires injection after `inject_delay` regardless of
+        // whether the camera is producing data. Without a dedicated timer, this check only
+        // ran opportunistically inside the upstream frame loop below — so a stalled or silent
+        // camera during warm-up would delay injection indefinitely instead of the configured
+        // number of seconds.
+        if self.cfg.mode == Mode::Inject {
+            let ready_t = inject_ready.clone();
+            let delay = self.cfg.inject_delay;
+            let stop_t = stop.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = tokio::time::sleep(delay) => ready_t.notify_waiters(),
+                    _ = stop_t.notified() => {}
+                }
+            });
+        }
 
         // ── Downstream relay: NVR → camera ────────────────────────────────
         let stop_d  = stop.clone();
@@ -121,7 +161,7 @@ impl MITMSession {
                                 if uw.write_all(&buf[..n]).await.is_err() {
                                     stop_d.notify_waiters(); break;
                                 }
-                                stats_d.lock().await.down_bytes += n as u64;
+                                stats_d.down_bytes.fetch_add(n as u64, Ordering::Relaxed);
                             }
                         }
                     }
@@ -137,20 +177,35 @@ impl MITMSession {
         let stats_u        = stats.clone();
         let stop_u         = stop.clone();
 
-        let cap_writer: Option<Arc<std::sync::Mutex<BufWriter<std::fs::File>>>> =
-            if cfg_u.mode == Mode::Record {
-                let f = OpenOptions::new()
-                    .create(true).append(true)
-                    .open(&cfg_u.capture_file)?;
-                Some(Arc::new(std::sync::Mutex::new(BufWriter::with_capacity(256 * 1024, f))))
-            } else {
-                None
-            };
+        // Capture writes happen on a dedicated blocking thread so a slow disk
+        // never stalls the live CAM→NVR relay (which shares this task).
+        let cap_tx: Option<mpsc::Sender<CapMsg>> = if cfg_u.mode == Mode::Record {
+            let (tx, mut rx) = mpsc::channel::<CapMsg>(1024);
+            let path = cfg_u.capture_file.clone();
+            let f = OpenOptions::new()
+                .create(true).append(true)
+                .open(&path)?;
+            tokio::task::spawn_blocking(move || {
+                let mut w = BufWriter::with_capacity(256 * 1024, f);
+                while let Some(msg) = rx.blocking_recv() {
+                    match msg {
+                        CapMsg::Frame(channel, payload) => {
+                            let _ = write_frame(&mut w, channel, &payload);
+                        }
+                        CapMsg::Flush => { let _ = w.flush(); }
+                    }
+                }
+                let _ = w.flush();
+            });
+            Some(tx)
+        } else {
+            None
+        };
 
         let cw_shared = Arc::new(Mutex::new(cw));
         let cw_inj    = cw_shared.clone();
         let cw_up     = cw_shared.clone();
-        let cap_u     = cap_writer.clone();
+        let cap_u     = cap_tx.clone();
         let stop_u2   = stop.clone();
 
         let up_task = tokio::spawn(async move {
@@ -162,7 +217,6 @@ impl MITMSession {
                 None
             };
 
-            let warmup_start     = Instant::now();
             let mut inject_fired = false;
 
             loop {
@@ -175,7 +229,7 @@ impl MITMSession {
                 };
 
                 debug!("CAM→proxy {} bytes", n);
-                stats_u.lock().await.up_bytes += n as u64;
+                stats_u.up_bytes.fetch_add(n as u64, Ordering::Relaxed);
 
                 let chunks = parser.feed(&buf[..n]);
 
@@ -203,11 +257,6 @@ impl MITMSession {
                                         inject_ready_u.notify_waiters();
                                         inject_fired = true;
                                     }
-                                    if !inject_fired && warmup_start.elapsed() >= cfg_u.inject_delay {
-                                        inject_ready_u.notify_waiters();
-                                        inject_fired = true;
-                                        info!("Warm-up elapsed (time-based) — starting injection");
-                                    }
                                 }
                             }
 
@@ -217,16 +266,18 @@ impl MITMSession {
                                 st.last_live_ts  = hdr.ts;
                             }
 
-                            if let Some(cap) = &cap_u {
-                                {
-                                    let mut w = cap.lock().unwrap();
-                                    let _ = write_frame(&mut *w, channel, &payload);
-                                }
-                                let mut st = stats_u.lock().await;
-                                st.captured += 1;
+                            if let Some(tx) = &cap_u {
                                 let limit = cfg_u.capture_frames;
-                                if limit > 0 && st.captured >= limit {
-                                    info!("Capture limit {} reached — stopping capture.", limit);
+                                let already = stats_u.captured.load(Ordering::Relaxed);
+                                if limit == 0 || already < limit {
+                                    if tx.try_send(CapMsg::Frame(channel, payload.clone())).is_err() {
+                                        warn!("Capture channel full — dropped one frame from the .rtp file (live stream unaffected)");
+                                    }
+                                    let now = stats_u.captured.fetch_add(1, Ordering::Relaxed) + 1;
+                                    if limit > 0 && now == limit {
+                                        info!("Capture limit {} reached — stopping capture (still forwarding live stream).", limit);
+                                        let _ = tx.try_send(CapMsg::Flush);
+                                    }
                                 }
                             }
 
@@ -242,10 +293,8 @@ impl MITMSession {
                 }
             }
 
-            if let Some(cap) = &cap_u {
-                if let Ok(mut w) = cap.lock() {
-                    let _ = w.flush();
-                }
+            if let Some(tx) = &cap_u {
+                let _ = tx.send(CapMsg::Flush).await;
             }
         });
 
@@ -257,6 +306,7 @@ impl MITMSession {
             let stats_i   = stats.clone();
             let stop_i    = stop.clone();
             let ready_i   = inject_ready.clone();
+            let cfg_i     = self.cfg.clone();
 
             Some(tokio::spawn(async move {
                 info!("Injection task started — waiting for warm-up signal.");
@@ -277,12 +327,30 @@ impl MITMSession {
                 let interval_ns = (1_000_000_000.0 / fps.max(1.0)) as u64;
                 let mut idx: usize = 0;
 
+                // Fixed-rate ticker: paces injected frames at the detected/configured
+                // FPS instead of firing as fast as the loop can spin. MissedTickBehavior::Delay
+                // means a slow write (or scheduler hiccup) delays the next tick rather than
+                // bursting frames afterward, so we never flood the NVR to catch up.
+                let mut ticker = tokio::time::interval(Duration::from_nanos(interval_ns.max(1)));
+                ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+                // Per-channel RTCP Sender Report bookkeeping. A real camera emits its own
+                // SR periodically with a wall-clock (NTP) timestamp; in --inject-only mode
+                // nothing from the real camera reaches the NVR at all, so if we want the
+                // NVR's wall-clock metadata to also say "now" instead of leaving it stale
+                // or absent, we have to fabricate SRs for our own injected stream.
+                let rtcp_enabled = cfg_i.rtcp_sr_interval > Duration::ZERO;
+                let mut rtcp_tracks: HashMap<u8, RtcpTrack> = HashMap::new();
+                let mut rtcp_ticker = tokio::time::interval(
+                    cfg_i.rtcp_sr_interval.max(Duration::from_millis(1))
+                );
+                rtcp_ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
+                rtcp_ticker.tick().await; // consume the immediate first tick — nothing sent yet
+
                 loop {
                     tokio::select! {
                         _ = stop_i.notified() => break,
-                        _ = async {
-                            let t0 = Instant::now();
-
+                        _ = ticker.tick() => {
                             let frame = &frames[idx % frames.len()];
                             idx += 1;
 
@@ -293,25 +361,43 @@ impl MITMSession {
                                 let mut w = cw_i.lock().await;
                                 if w.write_all(&wire).await.is_err() {
                                     stop_i.notify_waiters();
-                                    return;
+                                    break;
                                 }
                             }
 
-                            {
-                                let mut st = stats_i.lock().await;
-                                st.injected += 1;
-                                if st.injected % 100 == 0 {
-                                    debug!("Injected {} frames (seq={})", st.injected, inject_seq);
-                                }
+                            let injected = stats_i.injected.fetch_add(1, Ordering::Relaxed) + 1;
+                            if injected % 100 == 0 {
+                                debug!("Injected {} frames (seq={})", injected, inject_seq);
+                            }
+
+                            if rtcp_enabled {
+                                let used_ssrc = parse_rtp_header(&new_payload).map(|h| h.ssrc).unwrap_or(0);
+                                let payload_bytes = new_payload.len().saturating_sub(12) as u32;
+                                let track = rtcp_tracks.entry(frame.channel).or_default();
+                                track.ssrc = used_ssrc;
+                                track.last_rtp_ts = inject_ts;
+                                track.pkt_count = track.pkt_count.wrapping_add(1);
+                                track.octet_count = track.octet_count.wrapping_add(payload_bytes);
                             }
 
                             // Update seq/ts after send
                             inject_seq = inject_seq.wrapping_add(1);
                             inject_ts  = inject_ts.wrapping_add(ts_per_frame);
-
-                            // Pacing
-                            tokio::task::yield_now().await;
-                        } => {}
+                        }
+                        _ = rtcp_ticker.tick(), if rtcp_enabled => {
+                            let (ntp_secs, ntp_frac) = ntp_now();
+                            for (&channel, track) in rtcp_tracks.iter() {
+                                let sr = build_sr(track.ssrc, ntp_secs, ntp_frac, track.last_rtp_ts,
+                                                   track.pkt_count, track.octet_count);
+                                let wire = build_interleaved(rtcp_channel_for(channel), &sr);
+                                let mut w = cw_i.lock().await;
+                                if w.write_all(&wire).await.is_err() {
+                                    stop_i.notify_waiters();
+                                    break;
+                                }
+                            }
+                            debug!("Sent RTCP SR for {} channel(s), NTP={}.{}", rtcp_tracks.len(), ntp_secs, ntp_frac);
+                        }
                     }
                 }
             }))
@@ -325,10 +411,12 @@ impl MITMSession {
         up_task.abort();
         if let Some(t) = inj_task { t.abort(); }
 
-        let st = stats.lock().await;
         info!(
             "Tunnel closed. up={}B down={}B captured={} injected={}",
-            st.up_bytes, st.down_bytes, st.captured, st.injected
+            stats.up_bytes.load(Ordering::Relaxed),
+            stats.down_bytes.load(Ordering::Relaxed),
+            stats.captured.load(Ordering::Relaxed),
+            stats.injected.load(Ordering::Relaxed),
         );
 
         Ok(())

@@ -9,6 +9,7 @@
 mod capture;
 mod parser;
 mod proxy;
+mod rtcp;
 mod rtp_probe;
 
 use std::path::PathBuf;
@@ -84,6 +85,11 @@ struct Cli {
     /// Suppress real camera stream; send only injected frames downstream
     #[arg(long, default_value_t = false)]
     inject_only: bool,
+
+    /// Seconds between synthetic RTCP Sender Reports for the injected stream
+    /// (0 disables RTCP SR generation; the RTP-level replay still works either way)
+    #[arg(long, default_value_t = 5.0)]
+    rtcp_sr_interval: f64,
 
     /// Interface to kill existing RTSP connection (e.g. eth0)
     #[arg(long)]
@@ -191,6 +197,7 @@ async fn main() -> Result<()> {
         inject_fps:     cli.inject_fps,
         inject_ssrc:    cli.inject_ssrc,
         inject_only:    cli.inject_only,
+        rtcp_sr_interval: Duration::from_secs_f64(cli.rtcp_sr_interval.max(0.0)),
     });
 
     // Bind listener

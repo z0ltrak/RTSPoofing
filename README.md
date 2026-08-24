@@ -34,7 +34,8 @@ RTSPoofing/
 │   │   ├── proxy.rs       # Async MITM proxy core (Tokio)
 │   │   ├── capture.rs     # .rtp file I/O
 │   │   ├── parser.rs      # RTSP interleaved stream parser
-│   │   └── rtp_probe.rs   # Real-time RTP parameter detection
+│   │   ├── rtp_probe.rs   # Real-time RTP parameter detection
+│   │   └── rtcp.rs        # Synthetic RTCP Sender Report generation
 │   ├── Cargo.toml         # Rust dependencies
 │   └── target/release/    # Compiled binary
 │
@@ -64,6 +65,10 @@ Available through `--mode inject`.
 - Uses RTP timestamp-based pacing so the injected video plays at the correct speed.
 - Rewrites RTP sequence numbers, timestamps, and SSRC values for stream continuity.
 - Supports `--inject-only` to suppress the real camera stream and show only the replay.
+- Emits synthetic RTCP Sender Reports for the injected stream, on the RTCP channel
+  (RTP channel + 1, per the usual `interleaved=X-Y` convention), so the wall-clock
+  metadata a VMS/forensic tool would read also says "now" instead of going stale
+  or silent once the real camera's RTCP stops flowing. See `--rtcp-sr-interval` below.
 
 ### ARP Spoofing Support
 
@@ -228,13 +233,38 @@ Where:
 
 ### Injection Pacing
 
-The Rust version uses timestamp-based pacing:
+The Rust version paces injection on a fixed schedule, not a naive per-frame sleep:
 
 - Each injected frame advances the RTP timestamp by a fixed increment, `ts_per_frame`.
-- Frames are sent as fast as the network allows, without artificial delays.
-- The decoder uses RTP timestamps to play the video at the correct speed.
+- Frames fire on a `tokio::time::interval` ticker anchored to a fixed start time (`1 / fps` apart),
+  not `sleep(1 / fps)` re-computed after each write — the latter drifts into slow motion once
+  write time is added on top of the sleep, especially with variable frame sizes.
+- If a tick is missed (slow write, scheduler hiccup), the next one is simply delayed rather than
+  firing a burst of catch-up frames — so a stall never turns into a flood at the NVR.
+- Sending frames unpaced (as fast as the network allows) was the original approach, but it lets
+  the injector outrun the NVR's receive/jitter buffer, which is a common source of dropped or
+  visibly corrupted frames on the receiving end — hence the move to fixed-interval pacing.
 
-This avoids slow-motion issues that can occur with wall-clock pacing when frame sizes vary.
+### RTCP Sender Reports
+
+An RTP stream carries two independent notions of time: the RTP timestamp (a 90 kHz media
+clock, already rewritten for continuity — see above) and, separately, an RTCP Sender Report
+carrying a wall-clock (NTP) timestamp that some VMS/forensic export tools read instead of
+decoding the picture. In `--inject-only` mode nothing from the real camera reaches the NVR at
+all, so without generating our own RTCP that metadata would simply go silent — the injector
+fabricates a minimal SR (RC=0, no reception report blocks) per active media channel, every
+`--rtcp-sr-interval` seconds (default 5s, matching typical real-world cadence), on the RTCP
+channel implied by RFC 2326's `interleaved=X-Y` convention (RTCP channel = RTP channel + 1):
+
+- `ssrc` — the same SSRC used in the injected RTP frames on that channel.
+- NTP timestamp — the real wall clock at the moment the report is sent, so playback of an old
+  capture is reported as happening "now," not whenever it was originally recorded.
+- RTP timestamp, packet count, and octet count — kept consistent with the RTP frames actually
+  sent on that channel so far.
+
+Set `--rtcp-sr-interval 0` to disable it; the RTP-level replay works identically either way.
+Note the on-screen OSD timestamp some cameras burn into the picture itself is a separate,
+arguably more consequential piece of "time" — this only spoofs the RTCP metadata layer.
 
 ### Auto-Parameter Detection
 
@@ -250,8 +280,13 @@ These parameters are then used for smoother injection and stream continuity.
 ## Performance
 
 - Rust version: approximately 300 Mbps throughput, suitable for high-resolution streams.
-- Timestamp-based pacing reduces jitter and slow-motion artifacts.
-- Optional batch sending can reduce syscall overhead for high-frame-rate streams.
+- Fixed-interval injection pacing reduces jitter, slow-motion drift, and burst-induced frame drops.
+- Session stats (bytes/frames counters) are lock-free atomics rather than an async mutex shared
+  across every packet on the relay path.
+- `.rtp` capture writes happen on a dedicated blocking task, decoupled from the live relay via a
+  bounded channel, so disk I/O latency can no longer stall the camera→NVR forwarding path.
+- `--capture-frames` now actually stops writing to disk once the limit is reached (the live
+  relay keeps running); previously the limit was logged but never enforced.
 
 ## Testing the Python Prototype
 

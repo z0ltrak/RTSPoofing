@@ -40,8 +40,9 @@ impl InterleavedParser {
             // Find the next '$' marker
             match self.buf.iter().position(|&b| b == b'$') {
                 None => {
-                    // No interleaved frame ahead — flush all as text
-                    out.push(ParsedChunk::Text(self.buf.drain(..).collect()));
+                    // No interleaved frame ahead — flush all as text.
+                    // mem::take swaps the buffer out instead of draining/copying it.
+                    out.push(ParsedChunk::Text(std::mem::take(&mut self.buf)));
                     break;
                 }
                 Some(0) => {
@@ -53,7 +54,7 @@ impl InterleavedParser {
                     let length  = u16::from_be_bytes([self.buf[2], self.buf[3]]) as usize;
 
                     // Sanity check: valid RTP frames are at least 12 bytes
-                    if length < 8 || length > MAX_FRAME {
+                    if !(8..=MAX_FRAME).contains(&length) {
                         // False '$', skip it and emit as text
                         out.push(ParsedChunk::Text(self.buf.drain(..1).collect()));
                         continue;

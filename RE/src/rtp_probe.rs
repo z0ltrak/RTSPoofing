@@ -319,7 +319,7 @@ impl RTPProbe {
 
         if fps_samples.is_empty() { return None; }
 
-        fps_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        fps_samples.sort_by(|a, b| a.total_cmp(b));
         let mid = fps_samples.len() / 2;
         Some((fps_samples[mid] * 100.0).round() / 100.0)
     }

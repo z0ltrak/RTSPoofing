@@ -1,25 +1,55 @@
 ---
 theme: default
 background: '#0a0a0a'
+colorSchema: dark
 class: text-center
 highlighter: shiki
 lineNumbers: false
 transition: slide-left
 mdc: true
 fonts:
-  sans: 'JetBrains Mono'
+  sans: 'Inter'
   mono: 'JetBrains Mono'
+title: RTSPoofing
+info: |
+  ## RTSPoofing — Trust Me, I'm a Camera
+  A practical MITM + RTP replay attack against RTSP video-surveillance streams.
 ---
 
 # RTSPoofing
 ## *Trust Me, I'm a Camera* 🎥
 
 <div class="mt-8 text-gray-400 text-xl">
-Cómo convencer a un NVR de que eres una cámara legítima<br/>cuando claramente no lo eres
+How to convince an NVR you're a legitimate camera<br/>when you very much are not
 </div>
 
-<div class="mt-12 text-sm text-gray-600">
-⚠️ Con fines educativos. Probablemente.
+<div class="mt-10 text-gray-500">
+Martín López Aranburu<br/>
+Barcelona Cybersecurity Congress · November 2026
+</div>
+
+<div class="mt-10 text-sm text-gray-600">
+⚠️ Educational and authorized-testing purposes only.
+</div>
+
+---
+layout: default
+transition: fade
+---
+
+# Agenda
+
+<div class="mt-8 max-w-2xl mx-auto text-left">
+<v-clicks>
+
+- **The trust problem** — why RTSP/RTP was never built to resist this
+- **The attack, in three phases** — ARP spoof → MITM proxy → frame injection
+- **A field story** — how a hardened corporate firewall accidentally helped us
+- **What the NVR actually sees** — and why it can't tell the difference
+- **Detection & defense** — what actually stops this
+- **Takeaways** for anyone who buys, installs, or audits CCTV
+
+</v-clicks>
 </div>
 
 ---
@@ -27,12 +57,12 @@ layout: center
 transition: fade
 ---
 
-# ¿Quién tiene cámaras IP en su red?
+# Who here has IP cameras on their network?
 
 
 <v-click>
 <div class="mt-8 text-2xl text-green-400 text-center">
-¿Y quién sabe exactamente qué tráfico mandan?
+And who can say exactly what those cameras are sending?
 </div>
 <div class="mt-6 flex justify-center">
   <img src="/gifs/cat-stare.gif" class="rounded-lg" style="height:160px"/>
@@ -44,29 +74,29 @@ layout: center
 transition: zoom-out
 ---
 
-# El problema con las cámaras IP
+# The problem with IP cameras
 
 <div class="grid grid-cols-2 gap-12 mt-8 text-left">
-<div>
+<div class="card">
 
-### Lo que piensas que pasa
+### What you assume happens
 ```
-📷 Cámara → 🖥️ NVR
+📷 Camera → 🖥️ NVR
 ```
 <div class="mt-4 text-gray-400">
-Bonito. Simple. Seguro.
+Clean. Simple. Trusted.
 </div>
 
 </div>
-<div v-click>
+<div v-click class="card">
 
-### Lo que realmente pasa
+### What actually happens
 ```
-📷 Cámara → 🦹 Tú → 🖥️ NVR
+📷 Camera → 🦹 You → 🖥️ NVR
 ```
 <div class="mt-4 text-red-400">
-No tan bonito. No tan simple.<br/>
-Definitivamente no tan seguro.
+Not clean. Not simple.<br/>
+Definitely not trusted.
 </div>
 
 </div>
@@ -77,32 +107,32 @@ layout: center
 transition: slide-left
 ---
 
-# ¿Qué es RTSP?
+# What is RTSP?
 
 <div class="text-left max-w-2xl mx-auto mt-4">
 
-**Real Time Streaming Protocol** — el HTTP del vídeo vigilancia
+**Real Time Streaming Protocol** — the HTTP of video surveillance
 
 ```
 DESCRIBE rtsp://192.168.1.64/stream RTSP/1.0
 ↓
-200 OK — aquí tienes el SDP con los parámetros del stream
+200 OK — here's the SDP with the stream parameters
 
 SETUP rtsp://192.168.1.64/stream/track1 RTSP/1.0
 ↓
-200 OK — canal TCP interleaved asignado
+200 OK — interleaved TCP channel assigned
 
 PLAY rtsp://192.168.1.64/stream RTSP/1.0
 ↓
-💥 Aquí empieza el caos
+💥 This is where it gets interesting
 ```
 
 </div>
 
 <v-click>
 <div class="mt-4 text-center text-yellow-400 text-lg">
-Todo esto en texto plano. Sin cifrado. Sin autenticación obligatoria.<br/>
-En el 90% de las instalaciones.
+All of this in plaintext. No mandatory encryption. No stream authentication.<br/>
+In the overwhelming majority of real-world installs.
 </div>
 </v-click>
 
@@ -111,7 +141,7 @@ layout: default
 transition: fade
 ---
 
-# Anatomía del paquete RTP
+# Anatomy of an RTP packet
 
 <div class="text-left max-w-2xl mx-auto mt-2 font-mono text-sm">
 
@@ -119,13 +149,13 @@ transition: fade
  0                   1                   2                   3
  0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|V=2|P|X|  CC   |M|     PT      |       Sequence Number         |
+|V=2|P|X|  CC   |M|     PT      |       Sequence Number        |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 |                           Timestamp                           |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           Synchronization Source (SSRC) identifier           |
+|           Synchronization Source (SSRC) identifier            |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    💣 Tu vídeo aquí 💣                        |
+|                    💣 your video goes here 💣                 |
 +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
 ```
 
@@ -133,44 +163,48 @@ transition: fade
 
 <v-click>
 <div class="mt-4 grid grid-cols-3 gap-4 text-center text-sm">
-  <div class="bg-blue-900 rounded p-3">
+  <div class="card">
     <div class="text-blue-300 font-bold">Sequence Number</div>
-    <div class="text-gray-400 mt-1">Orden de los frames.<br/>Hay que mantenerlo.</div>
+    <div class="text-gray-400 mt-1">Frame ordering.<br/>Must stay continuous.</div>
   </div>
-  <div class="bg-green-900 rounded p-3">
+  <div class="card">
     <div class="text-green-300 font-bold">Timestamp</div>
-    <div class="text-gray-400 mt-1">Clock a 90000 Hz.<br/>Hay que continuarlo.</div>
+    <div class="text-gray-400 mt-1">90 kHz media clock.<br/>Must keep advancing.</div>
   </div>
-  <div class="bg-red-900 rounded p-3">
+  <div class="card">
     <div class="text-red-300 font-bold">SSRC</div>
-    <div class="text-gray-400 mt-1">ID del emisor.<br/>Hay que suplantarlo.</div>
+    <div class="text-gray-400 mt-1">Sender identity.<br/>Must be impersonated.</div>
   </div>
 </div>
 </v-click>
+
+<div class="mt-4 text-center text-gray-500 text-sm">
+Three fields. Zero authentication. That's the whole attack surface.
+</div>
 
 ---
 layout: center
 transition: slide-up
 ---
 
-# El ataque en 3 pasos
+# The attack, in three phases
 
 <div class="mt-6">
 <v-clicks>
 
 <div class="flex items-center gap-4 mb-5 text-xl">
-  <div class="w-12 h-12 bg-red-600 rounded-full flex items-center justify-center font-bold text-2xl flex-shrink-0">1</div>
-  <div><span class="text-red-400 font-bold">ARP Spoofing</span> — convencer a la red de que somos la cámara</div>
+  <div class="step-badge" style="background:#dc2626">1</div>
+  <div><span class="text-red-400 font-bold">ARP Spoofing</span> — convince the network we're the camera</div>
 </div>
 
 <div class="flex items-center gap-4 mb-5 text-xl">
-  <div class="w-12 h-12 bg-yellow-600 rounded-full flex items-center justify-center font-bold text-2xl flex-shrink-0">2</div>
-  <div><span class="text-yellow-400 font-bold">MITM Proxy</span> — interceptar y relayar el stream RTSP/RTP</div>
+  <div class="step-badge" style="background:#ca8a04">2</div>
+  <div><span class="text-yellow-400 font-bold">MITM Proxy</span> — transparently relay the RTSP/RTP session</div>
 </div>
 
 <div class="flex items-center gap-4 mb-5 text-xl">
-  <div class="w-12 h-12 bg-green-600 rounded-full flex items-center justify-center font-bold text-2xl flex-shrink-0">3</div>
-  <div><span class="text-green-400 font-bold">Frame Injection</span> — sustituir los frames reales por los nuestros</div>
+  <div class="step-badge" style="background:#16a34a">3</div>
+  <div><span class="text-green-400 font-bold">Frame Injection</span> — swap the real frames for ours</div>
 </div>
 
 </v-clicks>
@@ -178,7 +212,7 @@ transition: slide-up
 
 <v-click>
 <div class="mt-6 text-center text-gray-400 italic">
-  Todo esto mientras el NVR sigue feliz grabando lo que le mandamos.
+And the NVR keeps recording the whole time, none the wiser.
 </div>
 </v-click>
 
@@ -187,47 +221,46 @@ layout: center
 transition: zoom-out
 ---
 
-# Paso 1: ARP Spoofing
+# Phase 1: ARP Spoofing
 
 <div class="grid grid-cols-2 gap-8 mt-4 text-left">
-<div>
+<div class="card">
 
-**El problema:**
-La cámara y el NVR hablan directamente.
-Nosotros no existimos para ellos.
+**The problem:**<br/>
+The camera and the NVR talk to each other directly. We don't exist to them.
 
-**La solución:**
-Envenenar las tablas ARP de ambos.
+**The fix:**<br/>
+Poison both ARP caches.
 
 ```bash
 arpspoof -i eth0 -t <NVR> <CAM>
 arpspoof -i eth0 -t <CAM> <NVR>
 ```
 
-Ahora ambos creen que somos el otro. 😈
+Now both sides believe we're the other one.
 
 </div>
-<div v-click>
+<div v-click class="card">
 
-**El resultado:**
+**The result:**
 ```
-📷 Cámara
-    ↓ "Aquí está el NVR (MAC: nosotros)"
-🦹 Kali MITM
-    ↓ "Aquí está la Cámara (MAC: nosotros)"
+📷 Camera
+    ↓ "This is the NVR (MAC: us)"
+🦹 Attacker box
+    ↓ "This is the Camera (MAC: us)"
 🖥️ NVR
 ```
 
-El tráfico pasa por nosotros.<br/>
-Nadie se da cuenta.
+Traffic now flows through us.<br/>
+Neither side notices.
 
 </div>
 </div>
 
 <v-click>
 <div class="mt-4 text-center text-sm text-gray-500">
-⚠️ En redes con Dynamic ARP Inspection (DAI) esto no funciona.<br/>
-Que es exactamente lo que tiene el Forti. Gracias, Forti. 🙃
+⚠️ Doesn't work on networks with Dynamic ARP Inspection (DAI) —<br/>
+which is exactly what the corporate firewall on our test network had. Or so we thought.
 </div>
 </v-click>
 
@@ -236,68 +269,72 @@ layout: center
 transition: slide-left
 ---
 
-# Spoiler: el Forti nos ayudó sin querer
- 
+# Field story: the firewall helped us by accident
+
 <div class="text-center text-gray-500 text-sm mb-4 italic">
-  Fuimos a la red corporativa esperando un desastre. Encontramos un aliado inesperado.
+We went into the corporate network expecting a dead end. We found an unwitting accomplice instead.
 </div>
 <div class="grid grid-cols-2 gap-8 mt-2 text-left text-sm">
-<div>
-**Lo que esperábamos:**
-<div class="text-gray-400 mt-1 mb-3">DAI activo → ARP falso descartado → ataque muerto </div>
-**Lo que realmente pasó:**
-<div class="text-gray-400 mt-1">El switch no bloqueó nada. Detectó que la misma IP apareció en otro puerto y actualizó la tabla MAC. Porque eso es lo que hacen los switches.</div>
-<div class="mt-3 bg-gray-900 rounded p-3 font-mono text-xs">
-MAC 00:11:22:33:44:55 → puerto 5 (cámara)<br/>
-MAC 00:0c:29:31:23:67 → puerto 12 (nosotros)<br/>
-<span class="text-yellow-400">⚠ MAC FLAP detectado — actualizando tabla</span><br/>
-<span class="text-green-400">→ tráfico redirigido al puerto 12. Gracias. 👍</span>
+<div class="card">
+
+**What we expected:**
+<div class="text-gray-400 mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival.</div>
+
+**What actually happened:**
+<div class="text-gray-400 mt-1">The switch didn't block anything. It saw the same IP show up on a different port and simply updated its MAC table — because that's what switches do.</div>
+<div class="mt-3 bg-black rounded p-3 font-mono text-xs">
+MAC 00:11:22:33:44:55 → port 5 (camera)<br/>
+MAC 00:0c:29:31:23:67 → port 12 (us)<br/>
+<span class="text-yellow-400">⚠ MAC flap detected — updating table</span><br/>
+<span class="text-green-400">→ traffic redirected to port 12. Thanks. 👍</span>
 </div>
 </div>
-<div v-click>
-**El efecto colateral:**
-<div class="text-green-400 font-bold mt-1">La conexión TCP entre cámara y NVR se cae sola.</div>
-<div class="text-gray-400 mt-1 mb-3">El NVR reconecta → pasa por el proxy → profit.</div>
-<div class="bg-gray-900 rounded p-3 text-center">
-  <div class="text-yellow-400 font-bold mb-1">El switch Cisco/Fortinet/Aruba:</div>
-  <div class="text-gray-300 italic text-sm">"Detecto una anomalía de seguridad.<br/>Voy a redirigir el tráfico al atacante<br/>para proteger la red."</div>
-  <div class="text-gray-500 text-xs mt-2">— comportamiento no intencionado pero muy agradecido</div>
+<div v-click class="card">
+
+**The side effect:**
+<div class="text-green-400 font-bold mt-1">The existing camera↔NVR TCP session drops on its own.</div>
+<div class="text-gray-400 mt-1 mb-3">The NVR reconnects → this time through the proxy → done.</div>
+<div class="bg-black rounded p-3 text-center">
+  <div class="text-yellow-400 font-bold mb-1">The switch's implicit reasoning:</div>
+  <div class="text-gray-300 italic text-sm">"I see a network anomaly.<br/>I'll redirect traffic to the attacker<br/>to keep the network consistent."</div>
+  <div class="text-gray-500 text-xs mt-2">— unintended, but very cooperative</div>
 </div>
 </div>
 </div>
+
 ---
 layout: center
 transition: zoom-out
 ---
- 
-# MAC Flapping: el switch como cómplice involuntario
- 
-<div class="mt-4 text-center text-gray-400 text-sm mb-4">Paso a paso de lo que ocurre en la red corporativa</div>
+
+# MAC flapping: the switch as an unwitting accomplice
+
+<div class="mt-4 text-center text-gray-400 text-sm mb-4">Step by step, on the corporate network</div>
 <div class="max-w-2xl mx-auto">
 <v-clicks>
 <div class="flex items-start gap-3 mb-3">
-  <div class="w-7 h-7 bg-red-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">1</div>
-  <div class="text-sm text-gray-300">Activamos ARP spoof: anunciamos <span class="text-yellow-400 font-mono">IP_CAM → MAC_ATACANTE</span> al NVR</div>
+  <div class="step-badge-sm" style="background:#dc2626">1</div>
+  <div class="text-sm text-gray-300">We start ARP spoofing: announce <span class="text-yellow-400 font-mono">CAM_IP → ATTACKER_MAC</span> to the NVR</div>
 </div>
 <div class="flex items-start gap-3 mb-3">
-  <div class="w-7 h-7 bg-orange-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">2</div>
-  <div class="text-sm text-gray-300">El switch ve la misma IP en dos puertos distintos → detecta <span class="text-yellow-400 font-bold">MAC flapping</span></div>
+  <div class="step-badge-sm" style="background:#ea580c">2</div>
+  <div class="text-sm text-gray-300">The switch sees the same IP on two different ports → detects <span class="text-yellow-400 font-bold">MAC flapping</span></div>
 </div>
 <div class="flex items-start gap-3 mb-3">
-  <div class="w-7 h-7 bg-yellow-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">3</div>
-  <div class="text-sm text-gray-300">El switch actualiza la tabla MAC: ahora la IP de la cámara apunta a <span class="text-green-400 font-bold">nuestro puerto</span></div>
+  <div class="step-badge-sm" style="background:#ca8a04">3</div>
+  <div class="text-sm text-gray-300">It updates its MAC table: the camera's IP now maps to <span class="text-green-400 font-bold">our port</span></div>
 </div>
 <div class="flex items-start gap-3 mb-3">
-  <div class="w-7 h-7 bg-blue-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">4</div>
-  <div class="text-sm text-gray-300">El tráfico TCP entre NVR y cámara llega a nosotros → la <span class="text-red-400 font-bold">conexión se cae</span></div>
+  <div class="step-badge-sm" style="background:#2563eb">4</div>
+  <div class="text-sm text-gray-300">TCP traffic between NVR and camera arrives at us → the <span class="text-red-400 font-bold">session drops</span></div>
 </div>
 <div class="flex items-start gap-3 mb-3">
-  <div class="w-7 h-7 bg-green-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">5</div>
-  <div class="text-sm text-gray-300">El NVR detecta la caída y <span class="text-green-400 font-bold">reconecta automáticamente</span> → esta vez pasa por el proxy</div>
+  <div class="step-badge-sm" style="background:#16a34a">5</div>
+  <div class="text-sm text-gray-300">The NVR detects the drop and <span class="text-green-400 font-bold">auto-reconnects</span> — this time through the proxy</div>
 </div>
 <div class="flex items-start gap-3">
-  <div class="w-7 h-7 bg-purple-600 rounded-full flex items-center justify-center font-bold text-sm flex-shrink-0 mt-0.5">6</div>
-  <div class="text-sm text-gray-300">El proxy acepta la conexión. <span class="text-yellow-400 font-bold">El switch hizo nuestro trabajo.</span> 🤝</div>
+  <div class="step-badge-sm" style="background:#9333ea">6</div>
+  <div class="text-sm text-gray-300">The proxy accepts the connection. <span class="text-yellow-400 font-bold">The switch just did our job for us.</span> 🤝</div>
 </div>
 </v-clicks>
 </div>
@@ -307,55 +344,51 @@ layout: default
 transition: fade
 ---
 
-# Paso 2: El Proxy MITM
+# Phase 2: The MITM proxy
 
 <div class="mt-8 text-center">
-  El proxy hace <strong>tres cosas simultáneamente</strong>:
+  The proxy does <strong>three things at once</strong>:
 </div>
-
 
 <div class="mt-10 grid grid-cols-3 gap-6">
 
-  <!-- Columna 1 -->
-  <v-click>
-  <div>
-    <div class="text-5xl mb-4">①</div>
-    <div class="font-bold text-xl mb-3 text-blue-400">Negociación RTSP transparente</div>
-    <ul class="text-sm space-y-2 text-left">
-      <li>• Intercepta <code>DESCRIBE</code>, <code>SETUP</code>, <code>PLAY</code></li>
-      <li>• Reenvía a la cámara real</li>
-      <li>• Devuelve respuestas al NVR sin modificar</li>
-      <li class="text-green-400 font-medium">→ El NVR no detecta intermediario</li>
-    </ul>
-  </div>
-  </v-click>
+<v-click>
+<div class="card">
+  <div class="text-5xl mb-4">①</div>
+  <div class="font-bold text-xl mb-3 text-blue-400">Transparent RTSP negotiation</div>
+  <ul class="text-sm space-y-2 text-left">
+    <li>• Intercepts <code>DESCRIBE</code>, <code>SETUP</code>, <code>PLAY</code></li>
+    <li>• Forwards them to the real camera</li>
+    <li>• Relays the responses back unmodified</li>
+    <li class="text-green-400 font-medium">→ The NVR never sees a middleman</li>
+  </ul>
+</div>
+</v-click>
 
-  <!-- Columna 2 -->
-  <v-click>
-  <div>
-    <div class="text-5xl mb-4">②</div>
-    <div class="font-bold text-xl mb-3 text-blue-400">RTP Probe automático</div>
-    <ul class="text-sm space-y-2 text-left">
-      <li>• Analiza los primeros frames en tiempo real</li>
-      <li>• Detecta: PT, SSRC, codec (H264/H265), FPS</li>
-      <li class="text-green-400 font-medium">→ Sin configuración manual</li>
-    </ul>
-  </div>
-  </v-click>
+<v-click>
+<div class="card">
+  <div class="text-5xl mb-4">②</div>
+  <div class="font-bold text-xl mb-3 text-blue-400">Live RTP probing</div>
+  <ul class="text-sm space-y-2 text-left">
+    <li>• Analyzes the first frames in real time</li>
+    <li>• Detects PT, SSRC, codec (H.264/H.265), FPS</li>
+    <li class="text-green-400 font-medium">→ Zero manual configuration</li>
+  </ul>
+</div>
+</v-click>
 
-  <!-- Columna 3 -->
-  <v-click>
-  <div>
-    <div class="text-5xl mb-4">③</div>
-    <div class="font-bold text-xl mb-3 text-blue-400">Canal de inyección</div>
-    <ul class="text-sm space-y-2 text-left">
-      <li>• Mientras el stream fluye normalmente...</li>
-      <li>• En el momento elegido, sustituye los frames</li>
-      <li>• Reescribe seq numbers y timestamps</li>
-      <li class="text-green-400 font-medium">→ Para mantener continuidad</li>
-    </ul>
-  </div>
-  </v-click>
+<v-click>
+<div class="card">
+  <div class="text-5xl mb-4">③</div>
+  <div class="font-bold text-xl mb-3 text-blue-400">Injection channel</div>
+  <ul class="text-sm space-y-2 text-left">
+    <li>• Stream flows normally at first...</li>
+    <li>• ...then, on cue, frames get swapped</li>
+    <li>• Sequence numbers and timestamps rewritten</li>
+    <li class="text-green-400 font-medium">→ Continuity preserved throughout</li>
+  </ul>
+</div>
+</v-click>
 
 </div>
 
@@ -364,29 +397,29 @@ layout: center
 transition: slide-up
 ---
 
-# RTPProbe: Autodetección en tiempo real
+# RTPProbe: real-time auto-detection
 
 <div class="text-left max-w-2xl mx-auto mt-4 text-sm">
 
-Durante los primeros segundos el proxy **solo escucha**:
+For the first few seconds, the proxy **only listens**:
 
 ```
-[00:00.0] 🔍 Analizando stream...
-[00:01.2] PT=96 visto 847 veces → H264 dinámico
-[00:02.1] SSRC=0xDEAD1234 dominante (99.8% de frames)
-[00:02.8] FPS estimado: 25.0 Hz (via diff timestamps RTP)
-[00:03.0] Codec: H264 (FU-A fragmentado detectado)
-[00:03.0] ✅ Probe completo — iniciando inyección
+[00:00.0] 🔍 Analyzing stream...
+[00:01.2] PT=96 seen 847 times → dynamic H264
+[00:02.1] SSRC=0xDEAD1234 dominant (99.8% of frames)
+[00:02.8] Estimated FPS: 25.0 Hz (via RTP timestamp deltas)
+[00:03.0] Codec: H264 (fragmented FU-A detected)
+[00:03.0] ✅ Probe complete — starting injection
 ```
 
 </div>
 
 <v-click>
-<div class="mt-4 bg-gray-900 rounded-lg p-4 text-center">
-<div class="text-green-400 font-bold text-lg">¿Cómo detecta el FPS sin metadatos?</div>
+<div class="mt-4 card text-center">
+<div class="text-green-400 font-bold text-lg">How do you get FPS without any metadata?</div>
 <div class="text-gray-300 mt-2">
-Clock RTP estándar para vídeo = 90.000 Hz<br/>
-Si entre dos frames hay 3.600 ticks → 90000/3600 = <span class="text-yellow-400 font-bold">25 fps</span>
+Standard RTP video clock = 90,000 Hz.<br/>
+3,600 ticks between two frames → 90000 / 3600 = <span class="text-yellow-400 font-bold">25 fps</span>
 </div>
 </div>
 </v-click>
@@ -396,30 +429,34 @@ layout: center
 transition: slide-left
 ---
 
-# Paso 3: Frame Injection
+# Phase 3: Frame injection
 
 <div class="text-left max-w-2xl mx-auto mt-4">
 
-Una vez el probe tiene los parámetros, el injector:
+Once the probe has its parameters, the injector:
 
 <v-clicks>
 
-**① Lee frames pre-grabados** del archivo `.rtp`
-- Capturado previamente de la misma cámara
-- O generado desde cualquier vídeo con ffmpeg
+**① Reads pre-recorded frames** from a `.rtp` file
+- Captured earlier from the same camera
+- Or generated from any video with `ffmpeg`
 
-**② Reescribe cada frame RTP:**
-```python
-# Mantiene continuidad con el stream anterior
-seq  = (last_live_seq + frame_index + 1) & 0xFFFF
-ts   = (last_live_ts + frame_index * ts_increment) & 0xFFFFFFFF
-ssrc = detected_ssrc  # mismo SSRC que la cámara real
+**② Rewrites every RTP frame:**
+```rust
+// keeps continuity with the live stream that preceded it
+seq = last_live_seq.wrapping_add(idx + 1);
+ts  = last_live_ts.wrapping_add(idx * ts_per_frame);
+ssrc = detected_ssrc; // same SSRC the real camera used
 ```
 
-**③ El NVR recibe frames perfectamente válidos**
-- Misma secuencia numérica → sin saltos
-- Mismo SSRC → mismo "emisor"
-- Timestamps continuos → sin glitches
+**③ Paces frames on a fixed clock**, not "as fast as possible"
+- One tick per `1 / fps` seconds, self-correcting, never bursts to catch up
+- Getting this wrong is how you flood the NVR and get noticed
+
+**④ The NVR receives perfectly valid-looking frames**
+- Same sequence progression → no gaps
+- Same SSRC → same apparent sender
+- Continuous timestamps → no glitches
 
 </v-clicks>
 
@@ -430,110 +467,94 @@ layout: center
 transition: zoom-out
 ---
 
-# Lo que ve el NVR
+# What the NVR sees
 
 <div class="grid grid-cols-2 gap-8 mt-6 text-center">
-<div class="bg-gray-900 rounded-lg p-6">
+<div class="card">
   <div class="text-4xl mb-3">🎬</div>
-  <div class="text-green-400 font-bold text-lg">Stream real</div>
-  <div class="text-gray-400 mt-2 text-sm">Cámara apuntando al parking vacío<br/>a las 3 AM</div>
+  <div class="text-green-400 font-bold text-lg">Real stream</div>
+  <div class="text-gray-400 mt-2 text-sm">Camera pointed at an empty<br/>parking lot at 3 AM</div>
 </div>
-<div v-click class="bg-gray-900 rounded-lg p-6">
+<div v-click class="card">
   <div class="text-4xl mb-3">🎭</div>
-  <div class="text-red-400 font-bold text-lg">Stream inyectado</div>
-  <div class="text-gray-400 mt-2 text-sm">Grabación en bucle del mismo<br/>parking vacío de ayer</div>
+  <div class="text-red-400 font-bold text-lg">Injected stream</div>
+  <div class="text-gray-400 mt-2 text-sm">A looped recording of the same<br/>empty parking lot from yesterday</div>
 </div>
 </div>
 
 <v-click>
 <div class="mt-6 text-2xl text-yellow-400 text-center">
-  Para el NVR: indistinguible.
+To the NVR: indistinguishable.
 </div>
 <div class="text-gray-400 mt-1 text-center">
-  Mismo protocolo. Mismos parámetros. Misma fuente.
+Same protocol. Same parameters. Same apparent source.
 </div>
 </v-click>
 
----
-layout: center
-transition: fade
----
-
-# El NVR grabando nuestro vídeo
-
-<div class="flex justify-center mt-4">
-  <img src="/gifs/cat-happy.gif" class="rounded-lg" style="height:220px"/>
+<v-click>
+<div class="flex justify-center mt-6">
+  <img src="/gifs/cat-happy.gif" class="rounded-lg" style="height:150px"/>
 </div>
-
-<div class="mt-6 text-center text-xl text-gray-300">
-  El NVR: <span class="text-green-400">"Todo normal por aquí. Grabando. Sin novedad."</span>
+<div class="mt-3 text-center text-lg text-gray-300">
+The NVR: <span class="text-green-400">"All normal here. Recording. Nothing to report."</span>
 </div>
+</v-click>
 
 ---
 layout: center
 transition: slide-up
 ---
 
-# ¿Qué pasa si la conexión ya está establecida?
+# What if the session is already established?
 
 <div class="text-xl mt-4 text-gray-300 text-center">
-  El NVR ya está conectado a la cámara cuando arrancas el proxy.<br/>
-  Tu proxy escucha en el puerto 554 pero nadie conecta.
+The NVR is already connected to the camera when the proxy starts.<br/>
+It's listening on port 554, but nobody's dialing in.
 </div>
 
 <v-click>
-<div class="mt-6 bg-gray-900 rounded-lg p-5 text-left max-w-xl mx-auto">
+<div class="mt-6 card text-left max-w-xl mx-auto">
 
-**Solución: `tcpkill`**
+**Fix: `tcpkill`**
 
 ```bash
-# Rompe la sesión TCP existente
+# Tear down the existing TCP session
 tcpkill -9 -i eth0 host 192.168.1.64 and port 554
 ```
 
-El NVR detecta la desconexión → reconecta solo → esta vez pasa por el proxy.
+The NVR sees the disconnect → reconnects on its own → this time it goes through the proxy.
 
 </div>
 </v-click>
-
 
 ---
 layout: center
 transition: slide-left
 ---
 
-# Falsificando la hora
+# Two clocks: what's on screen vs. what's in the metadata
 
 <div class="mt-4 text-gray-300 text-lg text-center">
-Las cámaras mandan dos tipos de timestamps:
+Cameras actually carry two independent notions of "when":
 </div>
 
 <div class="grid grid-cols-2 gap-6 mt-4 text-left text-sm">
-<div class="bg-gray-900 rounded p-4">
-  <div class="text-blue-400 font-bold mb-2">RTP Timestamps</div>
-  <div class="text-gray-400">Clock a 90000 Hz para sincronización A/V.<br/>
-  <span class="text-green-400">✅ Ya los reescribimos.</span></div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">On-screen OSD timestamp <span class="tag tag-shipped ml-1">spoofed</span></div>
+  <div class="text-gray-400">Burned directly into the video pixels by the camera firmware — the one a human actually looks at.<br/>
+  <span class="text-green-400">✅ Free win: it's whatever timestamp the injected clip was recorded with.</span></div>
 </div>
-<div class="bg-gray-900 rounded p-4">
-  <div class="text-red-400 font-bold mb-2">RTCP Sender Reports</div>
-  <div class="text-gray-400">NTP wall-clock real.<br/>
-  El NVR los usa para saber la hora exacta del vídeo.<br/>
-  <span class="text-yellow-400">⚠️ Hay que reescribirlos también.</span></div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">RTCP Sender Report (NTP) <span class="tag tag-shipped ml-1">spoofed</span></div>
+  <div class="text-gray-400">A separate wall-clock field some VMS/forensic export tools read independently of the picture.<br/>
+  <span class="text-green-400">✅ We fabricate our own SR every few seconds, stamped with real "now."</span></div>
 </div>
 </div>
 
 <v-click>
-<div class="mt-4 bg-gray-900 rounded p-4 text-left text-sm max-w-xl mx-auto">
+<div class="mt-4 card text-left text-sm max-w-xl mx-auto">
 
-```
-RTCP Sender Report (PT=200):
-  bytes 0-7:  header + SSRC
-  bytes 8-11: NTP seconds    ← 🎯 aquí está la hora real
-  bytes 12-15: NTP fraction  ← 🎯 y aquí
-  bytes 16+:  RTP timestamp
-```
-
-Reescribimos esos 8 bytes con la hora que queramos. ✅
+The interesting finding isn't the RTCP mechanics — it's that **spoofing the picture already beats spoofing the metadata** for the audience that matters most: a human reviewing footage. RTCP tampering only matters against tooling that reads the wall clock instead of the frame. We built it anyway, because a technical audience will ask; it's not the headline risk.
 
 </div>
 </v-click>
@@ -543,31 +564,31 @@ layout: center
 transition: zoom-out
 ---
 
-# Entornos donde funciona
+# Where this actually works
 
-<div class="mt-4 grid grid-cols-3 gap-4 text-center text-sm">
+<div class="mt-4 grid grid-cols-3 gap-4 text-left text-sm">
 
 <v-clicks>
 
-<div class="bg-green-900 rounded-lg p-4">
-  <div class="text-3xl mb-2">🏠</div>
-  <div class="text-green-400 font-bold">Particulares</div>
-  <div class="text-gray-300 mt-2">Router doméstico sin DAI.<br/>ARP spoof funciona siempre.</div>
-  <div class="text-green-400 mt-2 font-bold text-lg">~100%</div>
+<div class="card">
+  <div class="text-3xl mb-2 text-center">🏠</div>
+  <div class="text-green-400 font-bold text-center">Home networks</div>
+  <div class="text-gray-300 mt-2 text-center">Consumer router, no DAI.</div>
+  <div class="text-green-400 mt-2 font-bold text-center">ARP spoof reliably works</div>
 </div>
 
-<div class="bg-yellow-900 rounded-lg p-4">
-  <div class="text-3xl mb-2">🏪</div>
-  <div class="text-yellow-400 font-bold">Pequeña empresa</div>
-  <div class="text-gray-300 mt-2">Switch no gestionable.<br/>Sin hardening de red.</div>
-  <div class="text-yellow-400 mt-2 font-bold text-lg">~90%</div>
+<div class="card">
+  <div class="text-3xl mb-2 text-center">🏪</div>
+  <div class="text-yellow-400 font-bold text-center">Small business</div>
+  <div class="text-gray-300 mt-2 text-center">Unmanaged switch, no network hardening.</div>
+  <div class="text-yellow-400 mt-2 font-bold text-center">Usually works</div>
 </div>
 
-<div class="bg-orange-900 rounded-lg p-4">
-  <div class="text-3xl mb-2">📹</div>
-  <div class="text-orange-400 font-bold">CCTV / NVR dedicado</div>
-  <div class="text-gray-300 mt-2">Red plana, Hikvision/Dahua.<br/>Instaladores sin formación.</div>
-  <div class="text-orange-400 mt-2 font-bold text-lg">~85%</div>
+<div class="card">
+  <div class="text-3xl mb-2 text-center">📹</div>
+  <div class="text-orange-400 font-bold text-center">Dedicated CCTV / NVR</div>
+  <div class="text-gray-300 mt-2 text-center">Flat network, common consumer-grade brands, installers with no security training.</div>
+  <div class="text-orange-400 mt-2 font-bold text-center">Often works</div>
 </div>
 
 </v-clicks>
@@ -576,34 +597,38 @@ transition: zoom-out
 
 <v-click>
 <div class="mt-4 bg-red-950 rounded-lg p-3 text-center text-sm">
-  <span class="text-red-400 font-bold">Donde NO funciona ARP spoof:</span>
-  <span class="text-gray-300 ml-2">Redes corporativas con DAI — como con el maldito Forti</span>
+  <span class="text-red-400 font-bold">Where ARP spoofing does NOT work:</span>
+  <span class="text-gray-300 ml-2">segmented corporate networks with DAI enforced correctly — and switches that don't quietly help you out</span>
 </div>
 </v-click>
+
+<div class="mt-2 text-center text-xs text-gray-600">
+Informal lab observations across our own test environments, not a controlled study.
+</div>
 
 ---
 layout: center
 transition: fade
 ---
 
-# Arquitectura completa
+# Full architecture
 
 <div class="text-left max-w-2xl mx-auto mt-4 font-mono text-sm">
 
 ```
 ┌─────────────┐         ┌──────────────────────┐         ┌─────────┐
-│   IP Cam    │────────▶│    Kali MITM (tú)    │────────▶│   NVR   │
+│   IP Cam    │────────▶│   Attacker box       │────────▶│   NVR   │
 │             │◀────────│                      │◀────────│         │
 └─────────────┘  TCP    │  ┌────────────────┐  │  TCP    └─────────┘
-                 RTSP   │  │  RTSP Proxy    │  │  RTSP
-                 RTP    │  │  RTPProbe      │  │  RTP
-                        │  │  Frame Inject  │  │  (modificado)
-                        │  └────────────────┘  │
-                        └──────────────────────┘
-                                  ↑
-                        ARP Spoof activo:
-                        CAM cree que NVR = Kali
-                        NVR cree que CAM = Kali
+                 RTSP    │  │  RTSP Proxy    │  │  RTSP
+                 RTP     │  │  RTPProbe      │  │  RTP
+                         │  │  Frame Inject  │  │  (modified)
+                         │  └────────────────┘  │
+                         └──────────────────────┘
+                                   ↑
+                         ARP spoof active:
+                         CAM believes NVR = us
+                         NVR believes CAM = us
 ```
 
 </div>
@@ -625,30 +650,30 @@ layout: center
 transition: zoom-out
 ---
 
-# ¿Cómo me protejo?
+# How do you actually stop this?
 
 <div class="mt-4 grid grid-cols-2 gap-5 text-left text-sm max-w-2xl mx-auto">
 
 <v-clicks>
 
-<div class="bg-gray-900 rounded-lg p-4">
-  <div class="text-blue-400 font-bold mb-2">🔒 VLAN dedicada para cámaras</div>
-  <div class="text-gray-400">Aislar el tráfico de videovigilancia del resto de la red.</div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">🔒 Dedicated VLAN for cameras</div>
+  <div class="text-gray-400">Isolate surveillance traffic from everything else on the network.</div>
 </div>
 
-<div class="bg-gray-900 rounded-lg p-4">
-  <div class="text-blue-400 font-bold mb-2">🛡️ Dynamic ARP Inspection</div>
-  <div class="text-gray-400">Switches gestionables con DAI activo. Bloquea el ARP spoof en origen.</div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">🛡️ Dynamic ARP Inspection, done right</div>
+  <div class="text-gray-400">Managed switches with DAI active — and MAC-flap handling that doesn't quietly reroute traffic to the anomaly.</div>
 </div>
 
-<div class="bg-gray-900 rounded-lg p-4">
-  <div class="text-blue-400 font-bold mb-2">🔐 RTSP sobre TLS</div>
-  <div class="text-gray-400">RTSPS cifra el canal. El proxy no puede leer ni modificar el stream.</div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">🔐 RTSP over TLS</div>
+  <div class="text-gray-400">RTSPS encrypts the channel — the proxy can no longer read or rewrite the stream.</div>
 </div>
 
-<div class="bg-gray-900 rounded-lg p-4">
-  <div class="text-blue-400 font-bold mb-2">📊 Monitorización de ARP</div>
-  <div class="text-gray-400">Detectar cambios anómalos en tablas ARP. Herramientas: arpwatch, XDR.</div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">📊 ARP / network monitoring</div>
+  <div class="text-gray-400">Flag anomalous ARP table changes. Tooling: arpwatch, NDR/XDR.</div>
 </div>
 
 </v-clicks>
@@ -660,17 +685,17 @@ layout: center
 transition: slide-up
 ---
 
-# Conclusiones
+# Takeaways
 
 <div class="mt-6 text-left max-w-xl mx-auto">
 
 <v-clicks>
 
-- Las cámaras IP confían **ciegamente** en quien les habla por TCP
-- RTSP/RTP no tiene mecanismos de autenticación del stream
-- El ataque funciona **sin tocar la cámara ni el NVR**
-- La detección es **casi imposible** desde el NVR sin monitorización de red
-- El 85-95% de instalaciones domésticas y PYMES son vulnerables **hoy**
+- IP cameras trust **anything that talks TCP to them on the right port**
+- RTSP/RTP has **no built-in stream authentication**
+- The attack works **without touching the camera or the NVR firmware**
+- Detection from the NVR alone is **close to impossible** without network-level monitoring
+- Most of the home and SMB installs we tested were vulnerable **today, out of the box**
 
 </v-clicks>
 
@@ -678,9 +703,9 @@ transition: slide-up
 
 <v-click>
 <div class="mt-6 text-center text-yellow-400 text-lg italic">
-"Si tu sistema de seguridad puede ser engañado<br/>
-por un script de Python de 700 líneas...<br/>
-quizás no es tan seguro."
+"If your security system can be fooled<br/>
+by a few hundred lines of code...<br/>
+maybe it isn't as secure as the sticker on the box suggests."
 </div>
 </v-click>
 
@@ -689,15 +714,15 @@ layout: center
 transition: fade
 ---
 
-# Una última reflexión
+# One last thought
+
 <v-click>
 <div class="flex justify-center mt-4">
-  <img src="/gifs/ооо.gif" class="rounded-lg" style="height:180px"/>
+  <img src="/gifs/meory-wipe.gif" class="rounded-lg" style="height:180px"/>
 </div>
 
-
-<div class="mt-6 bg-gray-900 rounded-xl p-6 max-w-2xl mx-auto text-center">
-  <div class="text-gray-500 text-sm mb-3">— Midnight Blue, sobre firmware de cámaras Dahua</div>
+<div class="mt-6 card max-w-2xl mx-auto text-center">
+  <div class="text-gray-500 text-sm mb-3">— Midnight Blue, on Dahua camera firmware</div>
   <div class="text-white text-xl italic leading-relaxed">
     "Since it is all code written by Dahua,<br/>
     <span class="text-red-400 font-bold">there must be a parsing bug somewhere.</span>"
@@ -707,7 +732,7 @@ transition: fade
 
 <v-click>
 <div class="mt-4 text-center text-gray-500 text-sm">
-  Spoiler: había varios.
+Spoiler: there were several.
 </div>
 </v-click>
 
@@ -721,16 +746,16 @@ class: text-center
 ## *Trust Me, I'm a Camera* 🎥
 
 <div class="mt-8 text-gray-400">
-Código disponible tras la charla.<br/>
-Úsalo con responsabilidad. O no. Pero que no te pillen.
+Code available after the talk, for research and authorized testing.<br/>
+Please use it responsibly — and get written authorization first.
 </div>
 
 <div class="mt-8 text-sm text-gray-600">
-⚠️ Esta charla es con fines educativos.<br/>
-Testar en redes ajenas sin autorización es ilegal.<br/>
-No me hago responsable de lo que hagáis con esto.
+⚠️ This talk is for educational purposes.<br/>
+Testing networks you don't own or have explicit authorization for is illegal.<br/>
+I'm not responsible for what you do with this.
 </div>
 
 <div class="mt-8 text-3xl">
-<v-click>¿Preguntas?</v-click> <v-click>¿Donaciones?</v-click> <v-click>¿Denuncias?</v-click>
+<v-click>Questions?</v-click>
 </div>
