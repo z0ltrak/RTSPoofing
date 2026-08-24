@@ -464,6 +464,73 @@ ssrc = detected_ssrc; // same SSRC the real camera used
 
 ---
 layout: center
+transition: slide-up
+---
+
+# Not every camera uses TCP
+
+<div class="mt-4 text-gray-300 text-lg text-center">
+RTSP's SETUP negotiates <strong>one of two transports</strong> — everything so far assumed the first:
+</div>
+
+<div class="grid grid-cols-2 gap-6 mt-4 text-left text-sm">
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">TCP-interleaved</div>
+  <div class="text-gray-400"><code>interleaved=0-1</code> — RTP/RTCP framed inside the RTSP TCP connection itself. What we've shown so far.</div>
+</div>
+<div class="card">
+  <div class="text-blue-400 font-bold mb-2">UDP <span class="tag tag-shipped ml-1">also supported</span></div>
+  <div class="text-gray-400"><code>client_port=X-Y</code> — RTP/RTCP as independent datagrams on their own negotiated ports. More common in practice.</div>
+</div>
+</div>
+
+<v-click>
+<div class="mt-4 card text-left text-sm max-w-xl mx-auto">
+The catch: ARP spoofing already puts us on-path at layer 2 — so UDP between camera and NVR would just get <strong>transparently IP-forwarded by the kernel</strong>, without ever reaching our code. Useless for injection: we need to actually own the datagrams, not just route them.
+</div>
+</v-click>
+
+---
+layout: center
+transition: zoom-out
+---
+
+# The fix: rewrite the negotiation, not just the network
+
+<div class="mt-4 text-center text-gray-400 text-sm mb-4">Same MITM idea as ARP spoofing, one layer up — applied to the SETUP handshake we already control</div>
+<div class="max-w-2xl mx-auto">
+<v-clicks>
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#dc2626">1</div>
+  <div class="text-sm text-gray-300">NVR's SETUP says <span class="text-yellow-400 font-mono">client_port=8000-8001</span> — we swap it for ports <span class="text-green-400 font-bold">we</span> own before forwarding to the camera</div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#ea580c">2</div>
+  <div class="text-sm text-gray-300">Camera now unknowingly sends its RTP/RTCP <span class="text-yellow-400 font-bold">straight to us</span></div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#ca8a04">3</div>
+  <div class="text-sm text-gray-300">Camera's response says <span class="text-yellow-400 font-mono">server_port=9000-9001</span> — we swap that for ports we own too, and restore the NVR's own <code>client_port</code> so it isn't confused</div>
+</div>
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#2563eb">4</div>
+  <div class="text-sm text-gray-300">NVR now unknowingly sends its RTCP receiver reports <span class="text-yellow-400 font-bold">straight to us</span> too</div>
+</div>
+<div class="flex items-start gap-3">
+  <div class="step-badge-sm" style="background:#16a34a">5</div>
+  <div class="text-sm text-gray-300">Four sockets later, <span class="text-green-400 font-bold">same capture/inject/RTCP-SR pipeline</span> as TCP-interleaved — neither side ever notices the ports moved</div>
+</div>
+</v-clicks>
+</div>
+
+<v-click>
+<div class="mt-4 text-center text-sm text-gray-500">
+Same auto-detection, same fixed-interval pacing, same forged RTCP timestamps — the transport underneath is invisible to everything downstream.
+</div>
+</v-click>
+
+---
+layout: center
 transition: zoom-out
 ---
 
