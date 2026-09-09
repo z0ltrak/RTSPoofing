@@ -46,6 +46,48 @@ expectation now so nobody's waiting for a "new CVE" reveal that isn't coming.
 -->
 
 ---
+layout: center
+transition: fade
+---
+
+# Who am I
+
+<div class="mt-4 text-center">
+  <div class="text-2xl font-bold text-white">Martín López Aranburu</div>
+  <div class="mt-2 text-gray-400">Security researcher — network protocols & IoT/video-surveillance security</div>
+</div>
+
+<div class="mt-6 max-w-md mx-auto">
+<v-clicks>
+
+<div class="card mb-3">
+  <div class="text-blue-400 font-bold text-sm">🛠️ This talk</div>
+  <div class="text-gray-300 text-sm mt-1">Author of <strong>RTSPoofing</strong> — a Rust MITM + RTP-replay tool built to test how much an NVR actually verifies about the stream it's recording.</div>
+</div>
+
+<div class="card">
+  <div class="text-blue-400 font-bold text-sm">🎤 Here today</div>
+  <div class="text-gray-300 text-sm mt-1">Barcelona Cybersecurity Congress · November 2026</div>
+</div>
+
+</v-clicks>
+</div>
+
+<div class="mt-4 card max-w-md mx-auto text-center">
+  <div class="text-blue-400 font-bold">🔗 LinkedIn</div>
+  <div class="mt-1 text-gray-300 text-sm">linkedin.com/in/martín-lópez-aranburu</div>
+</div>
+
+<!--
+whoami slide — keep it to 20-30 seconds even with the extra cards. Name,
+one line on background, what the tool is and why you built it, where
+you're speaking, point at the LinkedIn if people want to connect after.
+Don't turn this into a résumé recitation — the room came for the attack,
+not the bio. Swap the "network protocols & IoT" framing for your actual
+role/title if you'd rather lead with that instead.
+-->
+
+---
 layout: default
 transition: fade
 ---
@@ -178,6 +220,11 @@ that pays off later on the UDP-transport slides.
 "Interleaved TCP channel assigned" here is deliberately the TCP-interleaved
 case — mention in passing that UDP transport also exists and we'll come
 back to it, so it's not a surprise later.
+
+This diagram skips over RTSP auth (Basic/Digest on these same requests) for
+clarity — that's deliberate, not an oversight; it's addressed later on the
+MITM proxy slide once "we're a transparent relay" has been established,
+which is the fact that actually answers it.
 -->
 
 ---
@@ -209,15 +256,15 @@ transition: fade
 <div class="mt-4 grid grid-cols-3 gap-4 text-center text-sm">
   <div class="card">
     <div class="text-blue-300 font-bold">Sequence Number</div>
-    <div class="text-gray-400 mt-1">Frame ordering.<br/>Must stay continuous.</div>
+    <div class="text-gray-400 mt-1">Frame ordering.<br/>Gaps OK, big jumps aren't.</div>
   </div>
   <div class="card">
     <div class="text-green-300 font-bold">Timestamp</div>
-    <div class="text-gray-400 mt-1">90 kHz media clock.<br/>Must keep advancing.</div>
+    <div class="text-gray-400 mt-1">90 kHz media clock.<br/>Should advance smoothly.</div>
   </div>
   <div class="card">
     <div class="text-red-300 font-bold">SSRC</div>
-    <div class="text-gray-400 mt-1">Sender identity.<br/>Must be impersonated.</div>
+    <div class="text-gray-400 mt-1">Sender identity.<br/>A change resets decode.</div>
   </div>
 </div>
 </v-click>
@@ -235,6 +282,15 @@ RTP/RTCP. SRTP exists and would fix this, essentially nobody in consumer/SMB
 CCTV uses it. That's basically the same point as the RTSP-over-TLS slide
 later, just at the transport vs. media-integrity layer — fine to flag now if
 someone asks, otherwise let the defense slide cover it.
+
+Be precise about "gaps are tolerated": RTP runs over UDP specifically because
+loss is expected, so decoders conceal small sequence gaps rather than failing
+outright — don't oversell fragility here, since a loss-tolerant receiver is
+actually good news for the attack (more slack than a room might assume, not
+less). What actually gets you noticed is a big/backward jump in sequence or
+timestamp, or an SSRC that changes mid-stream and forces a decoder reset —
+that's why the injector goes to the trouble of keeping all three continuous
+rather than because any single dropped packet would blow the whole thing up.
 -->
 
 ---
@@ -448,12 +504,12 @@ transition: fade
 <v-click>
 <div class="card">
   <div class="text-5xl mb-4">①</div>
-  <div class="font-bold text-xl mb-3 text-blue-400">Transparent RTSP negotiation</div>
+  <div class="font-bold text-xl mb-3 text-blue-400">Transparent relay</div>
   <ul class="text-sm space-y-2 text-left">
     <li>• Intercepts <code>DESCRIBE</code>, <code>SETUP</code>, <code>PLAY</code></li>
     <li>• Forwards them to the real camera</li>
     <li>• Relays the responses back unmodified</li>
-    <li class="text-green-400 font-medium">→ The NVR never sees a middleman</li>
+    <li class="text-green-400 font-medium">→ Never sees us, never needs the password</li>
   </ul>
 </div>
 </v-click>
@@ -493,6 +549,17 @@ connection — if anyone asks about implementation later, that's the answer.
 Item ① is also where UDP-transport support (later slides) hooks in: the
 same intercepted SETUP exchange is what lets us rewrite Transport headers
 for UDP sessions, not just relay TCP-interleaved ones.
+
+The Authorization-header line preempts a question a security audience will
+ask: "does this still work if the camera has a password on it?" Yes, and the
+reason is worth stating precisely — this is a transparent byte relay, not a
+new client authenticating on its own. The NVR already knows the camera's
+credentials and computes its own Basic/Digest Authorization header same as
+always; we just forward it untouched in both directions. We're not
+bypassing auth, we're sitting inside a session two already-authenticated
+parties are having. RTSP credentials protect against an unauthorized viewer
+opening a new connection — they do nothing against an on-path relay of an
+existing one.
 -->
 
 ---
@@ -543,35 +610,38 @@ transition: slide-left
 
 # Phase 3: Frame injection
 
-<div class="text-left max-w-2xl mx-auto mt-4">
-
-Once the probe has its parameters, the injector:
-
+<div class="mt-4 text-center text-gray-400 text-sm mb-3">Once the probe has its parameters, the injector:</div>
+<div class="max-w-2xl mx-auto">
 <v-clicks>
 
-**① Reads pre-recorded frames** from a `.rtp` file
-- Captured earlier from the same camera
-- Or generated from any video with `ffmpeg`
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#2563eb">1</div>
+  <div class="text-sm text-gray-300"><strong class="text-white">Reads pre-recorded frames</strong> from a <code>.rtp</code> file — captured earlier from the same camera, or generated from any video with <code>ffmpeg</code></div>
+</div>
 
-**② Rewrites every RTP frame:**
-```rust
-// keeps continuity with the live stream that preceded it
-seq = last_live_seq.wrapping_add(idx + 1);
-ts  = last_live_ts.wrapping_add(idx * ts_per_frame);
-ssrc = detected_ssrc; // same SSRC the real camera used
-```
+<div class="mb-3">
+  <div class="flex items-start gap-3 mb-1">
+    <div class="step-badge-sm" style="background:#7c3aed">2</div>
+    <div class="text-sm text-gray-300"><strong class="text-white">Rewrites every RTP frame</strong> — keeps continuity with the live stream that preceded it:</div>
+  </div>
+  <div class="bg-black rounded p-2 font-mono text-xs ml-10">
+    seq = last_live_seq.wrapping_add(idx + 1);<br/>
+    ts &nbsp;= last_live_ts.wrapping_add(idx * ts_per_frame);<br/>
+    ssrc = detected_ssrc; <span class="text-gray-500">// same SSRC the real camera used</span>
+  </div>
+</div>
 
-**③ Paces frames on a fixed clock**, not "as fast as possible"
-- One tick per `1 / fps` seconds, self-correcting, never bursts to catch up
-- Getting this wrong is how you flood the NVR and get noticed
+<div class="flex items-start gap-3 mb-3">
+  <div class="step-badge-sm" style="background:#ca8a04">3</div>
+  <div class="text-sm text-gray-300"><strong class="text-white">Paces frames on a fixed clock</strong>, not "as fast as possible" — one tick per <code>1/fps</code>, self-correcting; bursting to catch up is what gets you noticed</div>
+</div>
 
-**④ The NVR receives perfectly valid-looking frames**
-- Same sequence progression → no gaps
-- Same SSRC → same apparent sender
-- Continuous timestamps → no glitches
+<div class="flex items-start gap-3">
+  <div class="step-badge-sm" style="background:#16a34a">4</div>
+  <div class="text-sm text-gray-300"><strong class="text-white">The NVR receives valid-looking frames</strong> — same sequence progression, same SSRC, continuous timestamps: no gaps, no glitches</div>
+</div>
 
 </v-clicks>
-
 </div>
 
 <!--
