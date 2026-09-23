@@ -26,6 +26,10 @@
 \usepackage{xcolor}
 \usepackage[hidelinks]{hyperref}
 \usepackage{parskip}
+\usepackage{etoolbox}
+
+% every top-level \section starts a fresh page (subsections do not)
+\pretocmd{\section}{\clearpage}{}{}
 
 \setlength{\parskip}{0.55\baselineskip}
 \setlength{\parindent}{0pt}
@@ -145,10 +149,9 @@ RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipelin
 {\sffamily\bfseries\footnotesize\color{inkfaint} KEYWORDS\;\;}{\footnotesize\color{inksoft}RTSP \textperiodcentered\ RTP/RTCP \textperiodcentered\ man-in-the-middle \textperiodcentered\ ARP spoofing \textperiodcentered\ video surveillance \textperiodcentered\ IoT/embedded security \textperiodcentered\ protocol authentication}
 \end{tcolorbox}
 
-\vspace{6pt}
+\clearpage
+\thispagestyle{empty}
 {\small\tableofcontents}
-
-\newpage
 
 % =====================================================================
 \section{Introduction}

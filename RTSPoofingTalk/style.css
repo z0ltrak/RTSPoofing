@@ -1,18 +1,246 @@
-/* Shared components for the RTSPoofing deck. Slidev auto-loads this file. */
+/* RTSPoofing talk — "night-vision monitor" theme (cyan phosphor / REC red) */
+
+:root {
+  --rt-bg: #05090b;
+  --rt-bg-soft: #0a1317;
+  --rt-cyan: #4be8ff;
+  --rt-cyan-dim: #1c7f94;
+  --rt-red: #ff3b52;
+  --rt-amber: #ffb347;
+  --rt-green: #39d98a;
+  --rt-text: #dcecf0;
+  --rt-text-dim: #7a939c;
+  --rt-border: #16272d;
+
+  --slidev-theme-primary: var(--rt-cyan);
+
+  /* override Shiki's own bg vars so fenced code blocks match the theme, not their syntax theme */
+  --shiki-dark-bg: #000000;
+  --shiki-light-bg: #000000;
+}
+
+html.dark,
+.slidev-layout {
+  background: var(--rt-bg);
+  color: var(--rt-text);
+}
+
+.slidev-layout {
+  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', ui-monospace, Consolas, monospace;
+  background-image:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(75, 232, 255, 0.035) 0px,
+      rgba(75, 232, 255, 0.035) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+}
+
+.slidev-layout h1,
+.slidev-layout h2,
+.slidev-layout h3 {
+  font-family: 'JetBrains Mono', 'Fira Code', ui-monospace, Consolas, monospace;
+  letter-spacing: -0.01em;
+}
+
+@keyframes rt-rec-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+.slidev-layout h1 {
+  color: var(--rt-cyan);
+  text-shadow: 0 0 22px rgba(75, 232, 255, 0.35);
+}
+
+.slidev-layout h1::before {
+  content: '\25CF';
+  color: var(--rt-red);
+  font-size: 0.55em;
+  margin-right: 0.35em;
+  vertical-align: middle;
+  display: inline-block;
+  animation: rt-rec-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slidev-layout h1::before { animation: none; }
+}
+
+.slidev-layout h2 {
+  display: inline-block;
+  color: var(--rt-text);
+  border-left: 4px solid var(--rt-cyan);
+  padding-left: 0.5em;
+}
+
+.slidev-layout a {
+  color: var(--rt-cyan);
+}
+
+.slidev-layout strong {
+  color: var(--rt-cyan);
+  font-weight: 700;
+}
+
+.slidev-layout code {
+  background: rgba(75, 232, 255, 0.1);
+  color: var(--rt-cyan);
+  border: 1px solid var(--rt-border);
+  border-radius: 4px;
+  padding: 0.1em 0.35em;
+}
+
+/* the block-wrapping <code> inside a fenced ```code``` block is inline with
+   hard line breaks in its content, so a background+padding on it renders as
+   a fragmented per-line box rather than one block — reset it here and let
+   the .shiki/pre rule above own the whole block's background instead. */
+.slidev-layout pre code {
+  background: transparent !important;
+  border: none !important;
+  padding: 0 !important;
+  border-radius: 0 !important;
+  color: inherit;
+}
+
+.slidev-layout pre,
+.slidev-layout pre.shiki,
+.slidev-layout .shiki {
+  background: #000 !important;
+  border: 1px solid var(--rt-border);
+  border-radius: 8px;
+  box-shadow: 0 0 0 1px rgba(75, 232, 255, 0.07), 0 12px 30px rgba(0, 0, 0, 0.5);
+}
+
+.slidev-layout pre .line {
+  background: transparent !important;
+}
+
+.slidev-layout table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 0.85em;
+}
+
+.slidev-layout table th {
+  background: var(--rt-bg-soft);
+  color: var(--rt-cyan);
+  border-bottom: 2px solid var(--rt-cyan-dim);
+  text-align: left;
+  padding: 0.4em 0.7em;
+}
+
+.slidev-layout table td {
+  border-bottom: 1px solid var(--rt-border);
+  padding: 0.4em 0.7em;
+}
+
+.slidev-layout table tr:hover td {
+  background: rgba(75, 232, 255, 0.06);
+}
+
+.slidev-layout blockquote {
+  border-left: 4px solid var(--rt-red);
+  color: var(--rt-text-dim);
+  background: rgba(255, 59, 82, 0.06);
+  padding: 0.6em 1em;
+  border-radius: 0 6px 6px 0;
+}
+
+/* ---- semantic text utilities (use these, not raw Tailwind colors) ---- */
+
+.dim {
+  color: var(--rt-text-dim);
+}
+
+.accent {
+  color: var(--rt-cyan);
+  font-weight: 700;
+}
+
+.good {
+  color: var(--rt-green);
+  font-weight: 700;
+}
+
+.warn {
+  color: var(--rt-amber);
+  font-weight: 700;
+}
+
+.danger {
+  color: var(--rt-red);
+  font-weight: 700;
+}
+
+.glow {
+  color: var(--rt-cyan);
+  text-shadow: 0 0 18px rgba(75, 232, 255, 0.45);
+}
+
+.glow-danger {
+  color: var(--rt-red);
+  text-shadow: 0 0 18px rgba(255, 59, 82, 0.4);
+}
+
+/* ---- chips / badges ---- */
+
+.chip {
+  display: inline-block;
+  font-size: 0.7em;
+  padding: 0.15em 0.6em;
+  border-radius: 999px;
+  border: 1px solid var(--rt-cyan-dim);
+  color: var(--rt-cyan);
+  background: rgba(75, 232, 255, 0.08);
+  margin: 0 0.2em;
+}
+
+.chip-red {
+  border-color: var(--rt-red);
+  color: var(--rt-red);
+  background: rgba(255, 59, 82, 0.08);
+}
+
+.chip-amber {
+  border-color: var(--rt-amber);
+  color: var(--rt-amber);
+  background: rgba(255, 179, 71, 0.08);
+}
+
+.chip-green {
+  border-color: var(--rt-green);
+  color: var(--rt-green);
+  background: rgba(57, 217, 138, 0.08);
+}
+
+/* ---- cards ---- */
 
 .card {
-  background: #111827; /* gray-900 */
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: var(--rt-bg-soft);
+  border: 1px solid var(--rt-border);
   border-radius: 0.75rem;
   padding: 1rem;
 }
 
 .card-tight {
-  background: #111827;
-  border: 1px solid rgba(255, 255, 255, 0.07);
+  background: var(--rt-bg-soft);
+  border: 1px solid var(--rt-border);
   border-radius: 0.5rem;
   padding: 0.75rem;
 }
+
+/* dark terminal-style panel for inline "captured packet" style dumps */
+.console {
+  background: #000;
+  border: 1px solid var(--rt-border);
+  border-radius: 0.5rem;
+  color: var(--rt-text);
+  box-shadow: inset 0 0 0 1px rgba(75, 232, 255, 0.05);
+}
+
+/* ---- step badges (numbered circles used across the attack-phase slides) ---- */
 
 .step-badge {
   width: 2.75rem;
@@ -24,7 +252,7 @@
   justify-content: center;
   font-weight: 700;
   font-size: 1.25rem;
-  color: white;
+  color: #05090b;
 }
 
 .step-badge-sm {
@@ -37,9 +265,11 @@
   justify-content: center;
   font-weight: 700;
   font-size: 0.85rem;
-  color: white;
+  color: #05090b;
   margin-top: 0.125rem;
 }
+
+/* ---- roadmap/shipped tags (UDP-support callouts etc.) ---- */
 
 .tag {
   display: inline-block;
@@ -52,13 +282,64 @@
 }
 
 .tag-roadmap {
-  background: rgba(234, 179, 8, 0.15);
-  color: #eab308;
-  border: 1px solid rgba(234, 179, 8, 0.35);
+  background: rgba(255, 179, 71, 0.15);
+  color: var(--rt-amber);
+  border: 1px solid rgba(255, 179, 71, 0.35);
 }
 
 .tag-shipped {
-  background: rgba(34, 197, 94, 0.15);
-  color: #22c55e;
-  border: 1px solid rgba(34, 197, 94, 0.35);
+  background: rgba(57, 217, 138, 0.15);
+  color: var(--rt-green);
+  border: 1px solid rgba(57, 217, 138, 0.35);
+}
+
+/* ---- cover / section-divider / end slides: viewfinder HUD + REC badge ---- */
+
+.slidev-layout.cover,
+.slidev-layout.section,
+.slidev-layout.end {
+  background-image:
+    radial-gradient(ellipse at top left, rgba(75, 232, 255, 0.08), transparent 55%),
+    radial-gradient(ellipse at bottom right, rgba(255, 59, 82, 0.05), transparent 55%),
+    repeating-linear-gradient(
+      to bottom,
+      rgba(75, 232, 255, 0.035) 0px,
+      rgba(75, 232, 255, 0.035) 1px,
+      transparent 1px,
+      transparent 3px
+    );
+}
+
+.slidev-layout.cover::after,
+.slidev-layout.section::after,
+.slidev-layout.end::after {
+  content: '\25CF REC';
+  position: absolute;
+  top: 28px;
+  right: 40px;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  color: var(--rt-red);
+  opacity: 0.75;
+  animation: rt-rec-pulse 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .slidev-layout.cover::after,
+  .slidev-layout.section::after,
+  .slidev-layout.end::after { animation: none; }
+}
+
+/* corner viewfinder brackets on section-divider slides only */
+.slidev-layout.section::before {
+  content: '';
+  position: absolute;
+  inset: 28px;
+  border: 1px solid rgba(75, 232, 255, 0.12);
+  pointer-events: none;
+}
+
+.slidev-code-window {
+  border-radius: 8px;
 }
