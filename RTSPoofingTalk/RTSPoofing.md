@@ -409,9 +409,8 @@ spoofing — move at a good pace, this isn't the interesting part yet.
 
 The DAI caveat at the bottom is the setup for the field-story slide —
 deliver it a little too confidently ("so obviously this fails on a
-hardened network...") because the payoff is that it didn't, and the
-honest reason why turns out to be more interesting than the first
-explanation we had for it.
+hardened network...") because the payoff is that it didn't, and why is
+still an open question.
 -->
 
 ---
@@ -419,58 +418,53 @@ layout: center
 transition: slide-left
 ---
 
-# Field story: we were wrong about why this worked
+# Field story: the session that kept resetting
 
 <div class="text-center dim text-sm mb-4 italic">
-The best result of writing this up properly: going back with a real packet capture and catching our own mistake.
+A corporate network we expected to be a dead end for ARP spoofing.
 </div>
 <div class="grid grid-cols-2 gap-8 mt-2 text-left text-sm">
 <div class="card">
 
-**What we first thought:**
-<div class="dim mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival. It wasn't. We assumed the switch's MAC-learning had relearned the camera onto our port and redirected traffic "by accident."</div>
+**What we expected:**
+<div class="dim mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival.</div>
 
-**What the capture actually shows:**
-<div class="dim mt-1">The camera's real MAC never appears on our port — not once, across 6,000+ frames. Everything with the camera's IP leaves with <em>our</em> MAC, because that's just what a relaying proxy does. No flap required, none possible.</div>
+**What we found instead:**
+<div class="dim mt-1">The spoofing succeeded — why DAI didn't block it is still unconfirmed. Once in place, the camera↔NVR session kept dropping and reconnecting through the proxy, over and over.</div>
 
 </div>
 <div v-click class="card">
 
-**So what dropped the session?**
-<div class="danger font-bold mt-1">We did. The proxy itself sends the FIN.</div>
-<div class="dim mt-1 mb-3">Three teardown → reconnect cycles, all traced to our own TCP handling — not the switch, not DAI, not a network event at all.</div>
+**What the packet capture shows:**
+<div class="dim mt-1 mb-3">The camera's real MAC never touches the attacker's port — everything with the camera's IP leaves with the proxy's own MAC, because the proxy is a full TCP relay, not a bridge.</div>
+<div class="danger font-bold mt-1">The proxy itself sends the FIN.</div>
 <div class="console p-3 text-center">
-  <div class="warn font-bold mb-1">Open question:</div>
-  <div class="dim text-sm">Why DAI didn't block the spoofing in the first place is still unconfirmed.</div>
+  <div class="dim text-sm">Three teardown → reconnect cycles, irregular intervals — the signature of an internal fault, not switch behavior.</div>
 </div>
 </div>
 </div>
 
 <!--
-This used to be "the switch helped us by accident" — a MAC-flapping story.
-It was wrong, and this slide corrects it live instead of quietly swapping
-the deck. That correction is worth doing in front of the room: security
-audiences respect "we checked our own claim and it didn't hold up" far
-more than a tidy story that turns out to be unverified.
+Tell it as a story: expected DAI to block the ARP spoofing outright, it
+didn't, and the corporate network kept surfacing a session that dropped
+and reconnected every so often. There's a natural beat here where the room
+might assume the switch is somehow "helping" the attack along — let that
+sit for a second before the second card lands.
 
-The actual sequence, if asked for detail: packet capture showed the
-camera's real MAC never traverses the attacker's switch port — everything
-with the camera's IP egresses with the proxy's own MAC, because the proxy
-is a full TCP-terminating relay (two independent TCP stacks), never an L2-
-transparent forward. MAC-table flapping requires the same MAC seen on two
-ports; that can't happen here by construction. The repeated session drops
-we'd attributed to the switch "redirecting to the anomaly" were actually
-three FIN packets sent by the proxy itself, at irregular intervals — the
-signature of an internal fault, not a periodic network event. The likely
-culprit is somewhere in the pacing/segmentation path, but that hasn't been
-isolated against this codebase yet — don't overclaim it live; "a bug in
-our own connection handling, still being tracked down" is the honest
-answer.
+The evidence, if asked for detail: packet capture shows the camera's real
+MAC never crosses onto the attacker's port — everything with the camera's
+IP egresses with the proxy's own MAC, because the proxy is a full TCP-
+terminating relay (two independent TCP stacks, see Phase 2), never an
+L2-transparent forward. The session resets are the proxy's own doing:
+three FIN packets sent from its side, at irregular intervals — consistent
+with an internal fault, not a network event. The exact trigger inside the
+proxy's connection/pacing logic hasn't been isolated yet — say so plainly
+if asked rather than naming a specific bug.
 
-What's still genuinely unresolved: why the ARP spoofing wasn't blocked on
-a network believed to have DAI enabled. That's an open question now, not
-a solved one — say so plainly if asked. It may simply not have been
-enforced the way it was assumed to be.
+What's genuinely still open: why DAI didn't block the ARP spoofing on
+that network in the first place. Its enforcement was assumed, not
+independently confirmed — it may simply not have been active the way it
+was believed to be.
 -->
 
 ---
