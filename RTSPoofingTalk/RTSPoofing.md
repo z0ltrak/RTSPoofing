@@ -351,8 +351,8 @@ And the NVR keeps recording the whole time, none the wiser.
 <!--
 Roadmap slide for the technical middle third of the talk. Point at each
 number as you say it — this is the map the audience should be holding in
-their head through the ARP spoof, field story, MAC-flap, and proxy slides
-that follow.
+their head through the ARP spoof, field story, and proxy slides that
+follow.
 -->
 
 ---
@@ -407,9 +407,11 @@ which is exactly what the corporate firewall on our test network had. Or so we t
 Standard technique, most of the technical audience already knows ARP
 spoofing — move at a good pace, this isn't the interesting part yet.
 
-The DAI caveat at the bottom is the setup for the next two slides — deliver
-it a little too confidently ("so obviously this fails on a hardened
-network...") because the payoff is that it didn't.
+The DAI caveat at the bottom is the setup for the field-story slide —
+deliver it a little too confidently ("so obviously this fails on a
+hardened network...") because the payoff is that it didn't, and the
+honest reason why turns out to be more interesting than the first
+explanation we had for it.
 -->
 
 ---
@@ -417,50 +419,58 @@ layout: center
 transition: slide-left
 ---
 
-# Field story: the firewall helped us by accident
+# Field story: we were wrong about why this worked
 
 <div class="text-center dim text-sm mb-4 italic">
-We went into the corporate network expecting a dead end. We found an unwitting accomplice instead.
+The best result of writing this up properly: going back with a real packet capture and catching our own mistake.
 </div>
 <div class="grid grid-cols-2 gap-8 mt-2 text-left text-sm">
 <div class="card">
 
-**What we expected:**
-<div class="dim mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival.</div>
+**What we first thought:**
+<div class="dim mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival. It wasn't. We assumed the switch's MAC-learning had relearned the camera onto our port and redirected traffic "by accident."</div>
 
-**What actually happened:**
-<div class="dim mt-1">The switch didn't block anything. It saw the same IP show up on a different port and simply updated its MAC table — because that's what switches do.</div>
-<div class="mt-3 console p-3 font-mono text-xs">
-MAC 00:11:22:33:44:55 → port 5 (camera)<br/>
-MAC 00:0c:29:31:23:67 → port 12 (us)<br/>
-<span class="warn inline-flex items-center gap-1"><mdi-alert class="inline-block" /> MAC flap detected — updating table</span><br/>
-<span class="good">→ traffic redirected to port 12. Thanks.</span>
-</div>
+**What the capture actually shows:**
+<div class="dim mt-1">The camera's real MAC never appears on our port — not once, across 6,000+ frames. Everything with the camera's IP leaves with <em>our</em> MAC, because that's just what a relaying proxy does. No flap required, none possible.</div>
+
 </div>
 <div v-click class="card">
 
-**The side effect:**
-<div class="good font-bold mt-1">The existing camera↔NVR TCP session drops on its own.</div>
-<div class="dim mt-1 mb-3">The NVR reconnects → this time through the proxy → done.</div>
+**So what dropped the session?**
+<div class="danger font-bold mt-1">We did. The proxy itself sends the FIN.</div>
+<div class="dim mt-1 mb-3">Three teardown → reconnect cycles, all traced to our own TCP handling — not the switch, not DAI, not a network event at all.</div>
 <div class="console p-3 text-center">
-  <div class="warn font-bold mb-1">The switch's implicit reasoning:</div>
-  <div class="dim italic text-sm">"I see a network anomaly.<br/>I'll redirect traffic to the attacker<br/>to keep the network consistent."</div>
-  <div class="dim text-xs mt-2">— unintended, but very cooperative</div>
+  <div class="warn font-bold mb-1">Open question:</div>
+  <div class="dim text-sm">Why DAI didn't block the spoofing in the first place is still unconfirmed.</div>
 </div>
 </div>
 </div>
 
 <!--
-This is the highlight of the talk — the one finding that isn't in a textbook.
-Slow down here. Tell it as a story: we expected the DAI to kill the attack,
-we were ready to move on, and instead the switch itself became the
-attack's transport mechanism.
+This used to be "the switch helped us by accident" — a MAC-flapping story.
+It was wrong, and this slide corrects it live instead of quietly swapping
+the deck. That correction is worth doing in front of the room: security
+audiences respect "we checked our own claim and it didn't hold up" far
+more than a tidy story that turns out to be unverified.
 
-Be precise about what's actually novel: it's not that DAI failed to block
-ARP spoofing (it worked as designed for that). It's that basic MAC-learning
-behavior — a completely separate, unrelated switch feature — created a side
-channel that got us the same outcome anyway. That distinction is worth
-making explicitly if a network engineer in the audience pushes back.
+The actual sequence, if asked for detail: packet capture showed the
+camera's real MAC never traverses the attacker's switch port — everything
+with the camera's IP egresses with the proxy's own MAC, because the proxy
+is a full TCP-terminating relay (two independent TCP stacks), never an L2-
+transparent forward. MAC-table flapping requires the same MAC seen on two
+ports; that can't happen here by construction. The repeated session drops
+we'd attributed to the switch "redirecting to the anomaly" were actually
+three FIN packets sent by the proxy itself, at irregular intervals — the
+signature of an internal fault, not a periodic network event. The likely
+culprit is somewhere in the pacing/segmentation path, but that hasn't been
+isolated against this codebase yet — don't overclaim it live; "a bug in
+our own connection handling, still being tracked down" is the honest
+answer.
+
+What's still genuinely unresolved: why the ARP spoofing wasn't blocked on
+a network believed to have DAI enabled. That's an open question now, not
+a solved one — say so plainly if asked. It may simply not have been
+enforced the way it was assumed to be.
 -->
 
 ---
@@ -687,8 +697,8 @@ transition: zoom-out
 </div>
 
 <div class="card">
-  <div class="accent font-bold mb-2 flex items-center gap-2"><mdi-shield-lock-outline class="inline-block" /> Dynamic ARP Inspection, done right</div>
-  <div class="dim">Managed switches with DAI active — and MAC-flap handling that doesn't quietly reroute traffic to the anomaly.</div>
+  <div class="accent font-bold mb-2 flex items-center gap-2"><mdi-shield-lock-outline class="inline-block" /> Dynamic ARP Inspection, verified</div>
+  <div class="dim">Managed switches with DAI active — and actually tested against real spoofed ARP traffic, not just assumed to be enforced.</div>
 </div>
 
 <div class="card">
@@ -710,8 +720,9 @@ Land this constructively — after the demo, the room's attention is on "how
 exposed am I," so this is the slide that actually earns its place. Don't
 rush it just because it feels like a formality.
 
-The DAI bullet is a deliberate callback to the field story: it's not enough
-to turn DAI on, the MAC-flap handling has to not undo it.
+The DAI bullet is a deliberate callback to the field story: assuming a
+control is enforced isn't the same as confirming it is — that gap is the
+actual lesson from testing against a network believed to have DAI on.
 -->
 
 ---

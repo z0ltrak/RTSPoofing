@@ -144,7 +144,7 @@ Mart\'in L\'opez Aranburu \quad\textbullet\quad linkedin.com/in/mart\'in-l\'opez
 
 \begin{tcolorbox}[enhanced, colback=white, colframe=linec, boxrule=0.6pt, left=16pt,right=16pt,top=10pt,bottom=10pt]
 {\sffamily\bfseries\footnotesize\color{accentink} ABSTRACT}\par\vspace{4pt}
-RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipeline used by the large majority of consumer and small-business IP cameras and network video recorders (NVRs). By combining ARP-based network positioning with a byte-transparent RTSP relay and RTP-level frame substitution, an on-path attacker can silently replace a live camera feed with pre-recorded footage while the recording NVR continues to log a fully valid-looking stream --- correct sequence numbers, correct timestamps, correct sender identity, and, optionally, a forged RTCP wall-clock. This paper documents the attack's three-stage architecture, its extension to UDP-transported RTP, a field observation about switch MAC-address-table learning that let the attack proceed on a network configured with Dynamic ARP Inspection, and the concrete defenses that close each stage.
+RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipeline used by the large majority of consumer and small-business IP cameras and network video recorders (NVRs). By combining ARP-based network positioning with a byte-transparent RTSP relay and RTP-level frame substitution, an on-path attacker can silently replace a live camera feed with pre-recorded footage while the recording NVR continues to log a fully valid-looking stream --- correct sequence numbers, correct timestamps, correct sender identity, and, optionally, a forged RTCP wall-clock. This paper documents the attack's three-stage architecture, its extension to UDP-transported RTP, a corrected field finding --- an initial explanation for why the attack survived a network configured with Dynamic ARP Inspection that a later packet capture ruled out --- and the concrete defenses that close each stage.
 \par\vspace{8pt}
 {\sffamily\bfseries\footnotesize\color{inkfaint} KEYWORDS\;\;}{\footnotesize\color{inksoft}RTSP \textperiodcentered\ RTP/RTCP \textperiodcentered\ man-in-the-middle \textperiodcentered\ ARP spoofing \textperiodcentered\ video surveillance \textperiodcentered\ IoT/embedded security \textperiodcentered\ protocol authentication}
 \end{tcolorbox}
@@ -159,7 +159,7 @@ RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipelin
 
 The large majority of IP cameras and the NVRs that record them speak RTSP in plaintext, negotiate an RTP media session with no cryptographic integrity, and trust whatever arrives on the negotiated channel. This paper asks a narrow, concrete question: what does it actually take to make an NVR record a fabricated feed --- without touching camera or NVR firmware, without credentials, and without the NVR ever registering an anomaly --- and where, specifically, does that stop working?
 
-The answer is implemented as \textbf{RTSPoofing}, an asynchronous Rust/Tokio proxy (\raise0.3ex\hbox{$\scriptstyle\sim$}1{,}600 lines across eight modules) that performs the attack end-to-end against both transport modes RTSP supports. Sections~4--7 walk through its three-stage pipeline and its UDP extension in the order the implementation executes them. Section~8 documents an unplanned field finding --- a switch's own MAC-learning behavior undermining a correctly configured Dynamic ARP Inspection policy on a segmented corporate network. Sections~9--11 scope what was and wasn't verified, and Section~10 maps each stage to a specific, low-cost defense.
+The answer is implemented as \textbf{RTSPoofing}, an asynchronous Rust/Tokio proxy (\raise0.3ex\hbox{$\scriptstyle\sim$}1{,}600 lines across eight modules) that performs the attack end-to-end against both transport modes RTSP supports. Sections~4--7 walk through its three-stage pipeline and its UDP extension in the order the implementation executes them. Section~8 documents a field finding and its correction: an initial hypothesis that a switch's MAC-learning behavior had undermined a Dynamic ARP Inspection policy, which direct packet-capture analysis later ruled out, and what the evidence shows instead. Sections~9--11 scope what was and wasn't verified, and Section~10 maps each stage to a specific, low-cost defense.
 
 \begin{notebox}[SCOPE]
 All testing described here was performed in isolated lab environments or under explicit written authorization. Findings labeled \emph{informal} or \emph{field observation} come from the author's own test environments and are not a controlled study across a representative device population --- see \S9 and \S11 for the specific caveats.
@@ -385,51 +385,24 @@ The rationale for four sockets rather than two: some NVR/camera implementations 
 All four sockets feed the same \code{process\_camera\_frame()} path used for TCP-interleaved media, so probing, capture, injection, and RTCP forgery cannot silently diverge between the two transports --- auto-detection, pacing, and forged timestamps behave identically regardless of which one a given camera happens to use.
 
 % =====================================================================
-\section{Field observation: MAC-address-table learning}
-One test network was a segmented, managed corporate environment with, as far as could be determined, Dynamic ARP Inspection enabled --- the expectation going in was that forged ARP replies would simply be dropped and Phase~I would go no further.
+\section{Field observation: session resets on a segmented network}
+One test network was a segmented, managed corporate environment with, as far as could be determined, Dynamic ARP Inspection enabled --- the expectation going in was that forged ARP replies would simply be dropped and Phase~I would go no further. ARP spoofing succeeded there anyway, and the pre-existing camera\paperlr{}NVR TCP session repeatedly reset and reconnected through the proxy during testing. The first explanation offered for that pattern turned out to be wrong; this section reports the correction.
 
-\begin{fieldbox}[OBSERVED (HIGH CONFIDENCE)]
-After ARP spoofing began, a packet capture on the attacker host showed the switch's forwarding table relearn the camera's MAC address onto the attacker's switch port. The pre-existing camera\paperlr{}NVR TCP session subsequently reset, and the NVR's own reconnect logic established a new session --- this time through the proxy.
+\begin{cautionbox}[INITIAL HYPOTHESIS --- RETRACTED]
+The repeated reconnects were first attributed to the switch's MAC-address-table learning --- a mechanism distinct from and unrelated to DAI's ARP-payload validation --- relearning the camera's MAC address onto the attacker's port and redirecting the NVR's traffic there independently of the ARP spoof. That was flagged at the time as a candidate explanation, not a confirmed one. A direct packet capture has since ruled it out.
+\end{cautionbox}
+
+\begin{fieldbox}[WHAT THE CAPTURE ACTUALLY SHOWS]
+Across 6{,}629 frames captured on the attacker host, the camera's real MAC address never appears on the attacker's switch port --- not once. Every frame carrying the camera's IP address egresses with the proxy's own MAC address instead, because the proxy relays traffic as a full network-layer forward, not as a bridge that preserves the original frame. MAC-table flapping requires the \emph{same} MAC address to be observed arriving on two different ports; by construction, that never happens here. The TCP handshake structure confirms the same thing at a different layer: the proxy answers the NVR's SYN with its own sequence number and its own advertised window, and presents itself as the camera's IP on port~554 --- two independent TCP stacks terminated by the proxy, exactly the Phase~II architecture described in \S5, never an L2-transparent forward that a MAC-flapping mechanism could ride on.
 \end{fieldbox}
 
-\begin{figure}[h]
-\centering
-\begin{tikzpicture}[
-  lifeline/.style={draw=linestrong, thick},
-  evbox/.style={draw=accentc, fill=accentsoft, rounded corners=2pt, font=\ttfamily\scriptsize, align=center, text=accentink},
-  lbl/.style={font=\ttfamily\scriptsize, text=inksoft},
-  >=Latex
-]
-\node[font=\sffamily\bfseries\small] (l1) at (0,0)   {Camera \textperiodcentered\ port 5};
-\node[font=\sffamily\bfseries\small] (l2) at (5.2,0) {Switch --- MAC table};
-\node[font=\sffamily\bfseries\small, text=accentc] (l3) at (10.4,0) {Attacker \textperiodcentered\ port 12};
+What actually explains the repeated disconnect-and-reconnect pattern is simpler, and less interesting as a network-security finding: the proxy closes the connection itself. The capture shows three distinct teardown events, each a FIN sent from the proxy's side to the NVR, at irregular intervals rather than on any periodic network schedule --- the signature of an internal fault condition, not an external one. Each FIN is followed within a few seconds by the NVR's own reconnect logic re-establishing the session, which is what had originally been read as the switch cooperating. The connection resets trace to a FIN sent by the proxy itself, not to switch behavior; the exact trigger within the proxy's own connection and segmentation handling was not isolated against this codebase's current implementation, and is left open here rather than asserted.
 
-\draw[lifeline] (0,0) -- (0,-7);
-\draw[lifeline] (5.2,0) -- (5.2,-7);
-\draw[lifeline] (10.4,0) -- (10.4,-7);
-
-\node[draw, rounded corners=2pt, font=\ttfamily\scriptsize] (t0) at (5.2,-0.9) {cam MAC \paperto\ port 5};
-
-\draw[->,thick] (0.4,-1.7) -- (5.0,-1.7) node[midway, above, lbl]{NVR traffic, forwarded to port 5};
-
-\node[evbox] (flap) at (5.2,-2.7) {MAC flap detected\\ table relearns \paperto\ port 12*};
-
-\draw[->,accentc,thick] (5.4,-3.6) -- (10.2,-3.6) node[midway, above, lbl, text=accentc]{NVR traffic, now redirected to port 12};
-
-\node[lbl] at (10.4,-4.3) {existing TCP session drops};
-
-\draw[->,thick,dashed] (10.2,-5.0) -- (5.4,-5.0) node[midway, above, lbl]{NVR reconnects \paperto\ session now via proxy};
-
-\node[lbl, text=inkfaint, font=\ttfamily\tiny] at (5.2,-6.4) {*trigger for the relearn is the candidate mechanism discussed in \S8, not directly isolated};
-\end{tikzpicture}
-\caption{The observed event chain: a MAC-table relearn redirects NVR traffic to the attacker's port, the existing session drops, and the NVR's own reconnect logic re-establishes it through the proxy.}
-\end{figure}
-
-\begin{notebox}[CANDIDATE MECHANISM (HEDGED)]
-MAC-address-table learning is a distinct, always-on layer-2 mechanism, unrelated to DAI's validation of ARP \emph{payloads}: a switch continuously rewrites its forwarding entry for a MAC address to whichever port most recently produced a frame carrying that source address, regardless of whether the ARP traffic that provoked the situation was itself permitted. The most plausible trigger here is frames carrying the camera's real source MAC arriving via the attacker's port during the ARP-cache transition window, causing the table entry to flap and resettle on the attacker's port. This was not isolated with a second capture on the switch itself, so this section reports the \emph{effect} with confidence and the mechanism as the best-supported explanation available --- not a confirmed root cause.
+\begin{notebox}[WHAT REMAINS UNRESOLVED]
+Ruling out MAC-table flapping does not explain why the ARP spoofing in \S4 was not blocked by DAI in the first place --- the original question this section set out to answer. That question is open again: DAI's enforcement status on this specific network was assumed rather than independently confirmed, and it is entirely possible it was not enforced the way it was believed to be. \S9 and \S10 have been revised accordingly: this network is no longer reported as a case where DAI held and something else defeated it, only as a case where the spoofing succeeded for a reason that was never established.
 \end{notebox}
 
-What's actionable regardless of the exact trigger: a correctly configured security control was circumvented by an entirely separate, unrelated feature of the same device. DAI did precisely what it was designed to do --- validate ARP payloads. Something else on the same switch, operating at a different layer of the same forwarding pipeline, produced the same outcome anyway. \S10 turns this into a specific audit item rather than a general ``enable DAI'' recommendation.
+Reporting the retraction is itself the point of keeping this section. The original explanation was hedged as a candidate precisely because it had not been independently verified, and it turned out to be wrong. Replacing an appealing, wrong explanation with a duller, evidence-backed one is a better outcome for a security paper than leaving the appealing version standing.
 
 % =====================================================================
 \section{Empirical scope}
@@ -444,13 +417,13 @@ Across the author's own test environments:
 Home networks & \textcolor{redc}{\bfseries Reliably works} & Consumer router, no DAI \\
 Small business & \textcolor{accentink}{\bfseries Usually works} & Unmanaged switch, no hardening \\
 Dedicated CCTV/NVR & \textcolor{accentink}{\bfseries Often works} & Flat network, consumer-grade gear \\
-Segmented corporate & \textcolor{greenc}{\bfseries Not observed to work} & DAI enforced \& MAC-learning that doesn't undermine it \\
+Segmented corporate & \textcolor{accentink}{\bfseries Succeeded once, unexplained} & DAI believed enforced; why the spoofing wasn't blocked is unresolved (\S8) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \begin{notebox}[CAVEAT, STATED PLAINLY]
-These are informal observations across the environments the author tested, not measurements from a controlled study across a representative device population. Treat category boundaries as directional, not statistical.
+These are informal observations across the environments the author tested, not measurements from a controlled study across a representative device population. Treat category boundaries as directional, not statistical. In particular, the single segmented-corporate data point should not be read as evidence that DAI is generally ineffective --- only that its enforcement on that specific network was never independently confirmed, and the mechanism that originally seemed to explain around it (\S8) did not hold up.
 \end{notebox}
 
 % =====================================================================
@@ -462,7 +435,7 @@ These are informal observations across the environments the author tested, not m
 \textbf{Stage} & \textbf{Defense} & \textbf{Why it works} \\
 \midrule
 Phase I & \textbf{Dedicated VLAN} for camera traffic & Removes the flat-network adjacency \S4 and \S9 depend on. \\[4pt]
-Phase I & \textbf{DAI, audited} --- not just enabled & \S8: confirm MAC-learning behavior doesn't quietly reroute traffic to an unrecognized port during a flap; toggling DAI on is necessary but, per \S8, not sufficient on its own. \\[4pt]
+Phase I & \textbf{DAI, verified} --- not just enabled & \S8: the one network in this study believed to have DAI enforced was still successfully spoofed, for a reason that was never established. Configuring DAI is not the same as confirming it actually drops forged ARP traffic in production; test that directly. \\[4pt]
 Phase II--III & \textbf{RTSP over TLS} (RTSPS) & Removes the proxy's ability to read or rewrite the plaintext control channel that \S5--\S7 all depend on --- the single defense that breaks the whole chain at once. \\[4pt]
 All stages & \textbf{ARP / network anomaly monitoring} & Detective control (arpwatch, NDR/XDR) for cases the preventive controls above miss or are misconfigured. \\
 \bottomrule
@@ -476,7 +449,7 @@ All stages & \textbf{ARP / network anomaly monitoring} & Detective control (arpw
 \item \textbf{Receiver loss tolerance favors the attacker.} Because RTP receivers conceal isolated gaps by design (\S2), the continuity requirements in \S6.1 are about avoiding a \emph{visible} discontinuity, not a hard technical requirement for the session to survive at all --- the attack surface is more forgiving than a literal reading of ``must stay continuous'' would suggest.
 \item \textbf{Four-socket rationale is a design assumption, not a confirmed finding.} \S7 states the source-port-validation rationale as the reason for the design; which specific NVR/camera implementations actually enforce it remains an open question for anyone extending this work.
 \item \textbf{RTCP-SR consumption by VMS/forensic tooling} (\S6.3) is plausible and consistent with the field's documented purpose (RFC~3550 \S6.4.1), but was not confirmed against a specific named product.
-\item \textbf{\S8's mechanism is a candidate explanation}, not a verified root cause --- restated here deliberately, since it's the paper's most novel claim and the one most worth an independent replication with switch-side capture.
+\item \textbf{\S8's original hypothesis was tested and retracted.} The switch MAC-learning explanation first offered for the field observation was flagged as unconfirmed and has since been ruled out by direct packet capture; \S8 now reports the corrected finding, and an open question (why DAI didn't block the spoofing) in its place. Kept here as the clearest example in this paper of a hedge doing its job.
 \end{itemize}
 
 % =====================================================================
