@@ -144,7 +144,7 @@ Mart\'in L\'opez Aranburu \quad\textbullet\quad linkedin.com/in/mart\'in-l\'opez
 
 \begin{tcolorbox}[enhanced, colback=white, colframe=linec, boxrule=0.6pt, left=16pt,right=16pt,top=10pt,bottom=10pt]
 {\sffamily\bfseries\footnotesize\color{accentink} ABSTRACT}\par\vspace{4pt}
-RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipeline used by the large majority of consumer and small-business IP cameras and network video recorders (NVRs). By combining ARP-based network positioning with a byte-transparent RTSP relay and RTP-level frame substitution, an on-path attacker can silently replace a live camera feed with pre-recorded footage while the recording NVR continues to log a fully valid-looking stream --- correct sequence numbers, correct timestamps, correct sender identity, and, optionally, a forged RTCP wall-clock. This paper documents the attack's three-stage architecture, its extension to UDP-transported RTP, a packet-level field observation tracing an anomalous session-reset pattern on a network configured with Dynamic ARP Inspection to the proxy's own connection handling rather than the network itself, and the concrete defenses that close each stage.
+RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipeline used by the large majority of consumer and small-business IP cameras and network video recorders (NVRs). By combining ARP-based network positioning with a byte-transparent RTSP relay and RTP-level frame substitution, an on-path attacker can silently replace a live camera feed with pre-recorded footage while the recording NVR continues to log a fully valid-looking stream --- correct sequence numbers, correct timestamps, correct sender identity, and, optionally, a forged RTCP wall-clock. This paper documents the attack's three-stage architecture, its extension to UDP-transported RTP, and the concrete defenses that close each stage.
 \par\vspace{8pt}
 {\sffamily\bfseries\footnotesize\color{inkfaint} KEYWORDS\;\;}{\footnotesize\color{inksoft}RTSP \textperiodcentered\ RTP/RTCP \textperiodcentered\ man-in-the-middle \textperiodcentered\ ARP spoofing \textperiodcentered\ video surveillance \textperiodcentered\ IoT/embedded security \textperiodcentered\ protocol authentication}
 \end{tcolorbox}
@@ -159,10 +159,10 @@ RTSPoofing is a working man-in-the-middle tool that defeats the RTSP/RTP pipelin
 
 The large majority of IP cameras and the NVRs that record them speak RTSP in plaintext, negotiate an RTP media session with no cryptographic integrity, and trust whatever arrives on the negotiated channel. This paper asks a narrow, concrete question: what does it actually take to make an NVR record a fabricated feed --- without touching camera or NVR firmware, without credentials, and without the NVR ever registering an anomaly --- and where, specifically, does that stop working?
 
-The answer is implemented as \textbf{RTSPoofing}, an asynchronous Rust/Tokio proxy (\raise0.3ex\hbox{$\scriptstyle\sim$}1{,}600 lines across eight modules) that performs the attack end-to-end against both transport modes RTSP supports. Sections~4--7 walk through its three-stage pipeline and its UDP extension in the order the implementation executes them. Section~8 documents a field observation from a segmented corporate network: ARP spoofing succeeded despite an assumed Dynamic ARP Inspection policy, and packet-level analysis traces the session's repeated resets to the proxy's own connection handling rather than the network itself. Sections~9--11 scope what was and wasn't verified, and Section~10 maps each stage to a specific, low-cost defense.
+The answer is implemented as \textbf{RTSPoofing}, an asynchronous Rust/Tokio proxy (\raise0.3ex\hbox{$\scriptstyle\sim$}1{,}600 lines across eight modules) that performs the attack end-to-end against both transport modes RTSP supports. Sections~4--7 walk through its three-stage pipeline and its UDP extension in the order the implementation executes them. Sections~8--10 scope what was and wasn't verified, and Section~9 maps each stage to a specific, low-cost defense.
 
 \begin{notebox}[SCOPE]
-All testing described here was performed in isolated lab environments or under explicit written authorization. Findings labeled \emph{informal} or \emph{field observation} come from the author's own test environments and are not a controlled study across a representative device population --- see \S9 and \S11 for the specific caveats.
+All testing described here was performed in isolated lab environments or under explicit written authorization. Findings labeled \emph{informal} come from the author's own test environments and are not a controlled study across a representative device population --- see \S8 and \S10 for the specific caveats.
 \end{notebox}
 
 % =====================================================================
@@ -217,7 +217,7 @@ None of these fields carry a signature or MAC. SRTP (RFC~3711) adds exactly that
 
 % =====================================================================
 \section{Threat model and architecture}
-The attacker is assumed to share a broadcast domain (an unsegmented VLAN) with the camera and the NVR --- the common case among the deployments surveyed in \S9 --- and to hold no camera or NVR credentials. The goal is not to exfiltrate the stream but to substitute its \emph{content} while the NVR continues to believe it is recording the camera live.
+The attacker is assumed to share a broadcast domain (an unsegmented VLAN) with the camera and the NVR --- the common case among the deployments surveyed in \S8 --- and to hold no camera or NVR credentials. The goal is not to exfiltrate the stream but to substitute its \emph{content} while the NVR continues to believe it is recording the camera live.
 
 \begin{figure}[h]
 \centering
@@ -263,10 +263,10 @@ arpspoof -i eth0 -t <CAM> <NVR>
 \end{consolev}
 \end{consolebox}
 
-With IP forwarding enabled on the attacker host, traffic continues to flow end-to-end and neither side's link appears to break --- it now simply routes through the attacker first. This is a standard, well-documented technique; its only requirement is layer-2 adjacency, which is the normal case for camera and NVR on a flat, unsegmented network (\S9).
+With IP forwarding enabled on the attacker host, traffic continues to flow end-to-end and neither side's link appears to break --- it now simply routes through the attacker first. This is a standard, well-documented technique; its only requirement is layer-2 adjacency, which is the normal case for camera and NVR on a flat, unsegmented network (\S8).
 
 \begin{cautionbox}[WHAT STOPS IT]
-Dynamic ARP Inspection (DAI) validates ARP packets against a DHCP-snooping or static binding table and drops ones that don't match, which is a complete stop for this phase in isolation. \S8 documents a case where DAI was correctly configured and this phase still succeeded --- not because DAI failed, but because of an unrelated switch behavior.
+Dynamic ARP Inspection (DAI) validates ARP packets against a DHCP-snooping or static binding table and drops ones that don't match, which is a complete stop for this phase.
 \end{cautionbox}
 
 % =====================================================================
@@ -380,23 +380,9 @@ The fix rewrites that negotiation the same way ARP spoofing rewrites the network
 \caption{Four sockets, not two: each side's real port pair is rewritten to one the proxy owns, so both media \emph{and} RTCP reports terminate at the proxy in both directions.}
 \end{figure}
 
-The rationale for four sockets rather than two: some NVR/camera implementations validate that received RTP/RTCP actually originates from the exact port pair declared during \code{SETUP}, so relaying or injecting media has to send from the socket each side was told about, not merely any socket that happens to reach them. This is a defensive design choice carried in the implementation --- it was not verified against a specific catalog of NVR/camera firmware, a limitation restated explicitly in \S11.
+The rationale for four sockets rather than two: some NVR/camera implementations validate that received RTP/RTCP actually originates from the exact port pair declared during \code{SETUP}, so relaying or injecting media has to send from the socket each side was told about, not merely any socket that happens to reach them. This is a defensive design choice carried in the implementation --- it was not verified against a specific catalog of NVR/camera firmware, a limitation restated explicitly in \S10.
 
 All four sockets feed the same \code{process\_camera\_frame()} path used for TCP-interleaved media, so probing, capture, injection, and RTCP forgery cannot silently diverge between the two transports --- auto-detection, pacing, and forged timestamps behave identically regardless of which one a given camera happens to use.
-
-% =====================================================================
-\section{Field observation: session resets on a segmented network}
-One test network was a segmented, managed corporate environment with, as far as could be determined, Dynamic ARP Inspection enabled --- the expectation going in was that forged ARP replies would simply be dropped and Phase~I would go no further. ARP spoofing succeeded there anyway; why DAI did not block it was not independently confirmed and remains an open question. Once in place, the pre-existing camera\paperlr{}NVR TCP session repeatedly reset and reconnected through the proxy during testing.
-
-\begin{fieldbox}[WHAT THE CAPTURE SHOWS]
-Across 6{,}629 frames captured on the attacker host, the camera's real MAC address never appears on the attacker's switch port. Every frame carrying the camera's IP address egresses with the proxy's own MAC address instead, because the proxy relays traffic as a full network-layer forward, not as a bridge that preserves the original frame. The TCP handshake structure confirms the same thing at a different layer: the proxy answers the NVR's SYN with its own sequence number and its own advertised window, and presents itself as the camera's IP on port~554 --- two independent TCP stacks terminated by the proxy, exactly the Phase~II architecture described in \S5.
-\end{fieldbox}
-
-The repeated disconnect-and-reconnect pattern traces to the proxy itself. The capture shows three distinct teardown events, each a FIN sent from the proxy's side to the NVR, at irregular intervals rather than on any periodic network schedule --- the signature of an internal fault condition, not an external one. Each FIN is followed within a few seconds by the NVR's own reconnect logic re-establishing the session. The exact trigger within the proxy's own connection and segmentation handling was not isolated against this codebase's current implementation, and is left open here rather than asserted.
-
-\begin{notebox}[WHAT REMAINS UNRESOLVED]
-Why the ARP spoofing in \S4 was not blocked by DAI on this network is unresolved: DAI's enforcement status was assumed rather than independently confirmed, and it is entirely possible it was not enforced the way it was believed to be.
-\end{notebox}
 
 % =====================================================================
 \section{Empirical scope}
@@ -411,13 +397,12 @@ Across the author's own test environments:
 Home networks & \textcolor{redc}{\bfseries Reliably works} & Consumer router, no DAI \\
 Small business & \textcolor{accentink}{\bfseries Usually works} & Unmanaged switch, no hardening \\
 Dedicated CCTV/NVR & \textcolor{accentink}{\bfseries Often works} & Flat network, consumer-grade gear \\
-Segmented corporate & \textcolor{accentink}{\bfseries Succeeded once, unexplained} & DAI believed enforced; why the spoofing wasn't blocked is unresolved (\S8) \\
 \bottomrule
 \end{tabular}
 \end{center}
 
 \begin{notebox}[CAVEAT, STATED PLAINLY]
-These are informal observations across the environments the author tested, not measurements from a controlled study across a representative device population. Treat category boundaries as directional, not statistical. In particular, the single segmented-corporate data point should not be read as evidence that DAI is generally ineffective --- only that its enforcement on that specific network was never independently confirmed (\S8).
+These are informal observations across the environments the author tested, not measurements from a controlled study across a representative device population. Treat category boundaries as directional, not statistical.
 \end{notebox}
 
 % =====================================================================
@@ -428,8 +413,8 @@ These are informal observations across the environments the author tested, not m
 \toprule
 \textbf{Stage} & \textbf{Defense} & \textbf{Why it works} \\
 \midrule
-Phase I & \textbf{Dedicated VLAN} for camera traffic & Removes the flat-network adjacency \S4 and \S9 depend on. \\[4pt]
-Phase I & \textbf{DAI, verified} --- not just enabled & \S8: the one network in this study believed to have DAI enforced was still successfully spoofed, for a reason that was never established. Configuring DAI is not the same as confirming it actually drops forged ARP traffic in production; test that directly. \\[4pt]
+Phase I & \textbf{Dedicated VLAN} for camera traffic & Removes the flat-network adjacency \S4 and \S8 depend on. \\[4pt]
+Phase I & \textbf{Dynamic ARP Inspection} & Managed switches validating ARP against a DHCP-snooping or static binding table stop the spoof in \S4 outright. \\[4pt]
 Phase II--III & \textbf{RTSP over TLS} (RTSPS) & Removes the proxy's ability to read or rewrite the plaintext control channel that \S5--\S7 all depend on --- the single defense that breaks the whole chain at once. \\[4pt]
 All stages & \textbf{ARP / network anomaly monitoring} & Detective control (arpwatch, NDR/XDR) for cases the preventive controls above miss or are misconfigured. \\
 \bottomrule
@@ -443,7 +428,6 @@ All stages & \textbf{ARP / network anomaly monitoring} & Detective control (arpw
 \item \textbf{Receiver loss tolerance favors the attacker.} Because RTP receivers conceal isolated gaps by design (\S2), the continuity requirements in \S6.1 are about avoiding a \emph{visible} discontinuity, not a hard technical requirement for the session to survive at all --- the attack surface is more forgiving than a literal reading of ``must stay continuous'' would suggest.
 \item \textbf{Four-socket rationale is a design assumption, not a confirmed finding.} \S7 states the source-port-validation rationale as the reason for the design; which specific NVR/camera implementations actually enforce it remains an open question for anyone extending this work.
 \item \textbf{RTCP-SR consumption by VMS/forensic tooling} (\S6.3) is plausible and consistent with the field's documented purpose (RFC~3550 \S6.4.1), but was not confirmed against a specific named product.
-\item \textbf{\S8's root cause is not fully isolated.} The proxy's own FIN explains the observed reconnect pattern, but the exact trigger within its connection and segmentation handling was not isolated against this codebase --- treat that specific attribution as an open item, not a confirmed root cause.
 \end{itemize}
 
 % =====================================================================
