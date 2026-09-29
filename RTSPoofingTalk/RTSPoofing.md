@@ -310,8 +310,8 @@ transition: fade
 ## The attack
 
 <!--
-Act divider. Three phases, one field story, one MITM proxy under the hood
-— everything through "What the NVR sees" lives in this act.
+Act divider. Three phases and one MITM proxy under the hood — everything
+through "What the NVR sees" lives in this act.
 -->
 
 ---
@@ -351,8 +351,7 @@ And the NVR keeps recording the whole time, none the wiser.
 <!--
 Roadmap slide for the technical middle third of the talk. Point at each
 number as you say it — this is the map the audience should be holding in
-their head through the ARP spoof, field story, and proxy slides that
-follow.
+their head through the ARP spoof and proxy slides that follow.
 -->
 
 ---
@@ -398,73 +397,13 @@ Neither side notices.
 
 <v-click>
 <div class="mt-4 text-center text-sm dim">
-<span class="inline-flex items-center gap-1"><mdi-alert class="warn inline-block" /> Doesn't work on networks with Dynamic ARP Inspection (DAI) —</span><br/>
-which is exactly what the corporate firewall on our test network had. Or so we thought.
+<span class="inline-flex items-center gap-1"><mdi-alert class="warn inline-block" /> Doesn't work on networks with Dynamic ARP Inspection (DAI).</span>
 </div>
 </v-click>
 
 <!--
 Standard technique, most of the technical audience already knows ARP
 spoofing — move at a good pace, this isn't the interesting part yet.
-
-The DAI caveat at the bottom is the setup for the field-story slide —
-deliver it a little too confidently ("so obviously this fails on a
-hardened network...") because the payoff is that it didn't, and why is
-still an open question.
--->
-
----
-layout: center
-transition: slide-left
----
-
-# Field story: the session that kept resetting
-
-<div class="text-center dim text-sm mb-4 italic">
-A corporate network we expected to be a dead end for ARP spoofing.
-</div>
-<div class="grid grid-cols-2 gap-8 mt-2 text-left text-sm">
-<div class="card">
-
-**What we expected:**
-<div class="dim mt-1 mb-3">DAI active → forged ARP dropped → attack dead on arrival.</div>
-
-**What we found instead:**
-<div class="dim mt-1">The spoofing succeeded — why DAI didn't block it is still unconfirmed. Once in place, the camera↔NVR session kept dropping and reconnecting through the proxy, over and over.</div>
-
-</div>
-<div v-click class="card">
-
-**What the packet capture shows:**
-<div class="dim mt-1 mb-3">The camera's real MAC never touches the attacker's port — everything with the camera's IP leaves with the proxy's own MAC, because the proxy is a full TCP relay, not a bridge.</div>
-<div class="danger font-bold mt-1">The proxy itself sends the FIN.</div>
-<div class="console p-3 text-center">
-  <div class="dim text-sm">Three teardown → reconnect cycles, irregular intervals — the signature of an internal fault, not switch behavior.</div>
-</div>
-</div>
-</div>
-
-<!--
-Tell it as a story: expected DAI to block the ARP spoofing outright, it
-didn't, and the corporate network kept surfacing a session that dropped
-and reconnected every so often. There's a natural beat here where the room
-might assume the switch is somehow "helping" the attack along — let that
-sit for a second before the second card lands.
-
-The evidence, if asked for detail: packet capture shows the camera's real
-MAC never crosses onto the attacker's port — everything with the camera's
-IP egresses with the proxy's own MAC, because the proxy is a full TCP-
-terminating relay (two independent TCP stacks, see Phase 2), never an
-L2-transparent forward. The session resets are the proxy's own doing:
-three FIN packets sent from its side, at irregular intervals — consistent
-with an internal fault, not a network event. The exact trigger inside the
-proxy's connection/pacing logic hasn't been isolated yet — say so plainly
-if asked rather than naming a specific bug.
-
-What's genuinely still open: why DAI didn't block the ARP spoofing on
-that network in the first place. Its enforcement was assumed, not
-independently confirmed — it may simply not have been active the way it
-was believed to be.
 -->
 
 ---
@@ -691,8 +630,8 @@ transition: zoom-out
 </div>
 
 <div class="card">
-  <div class="accent font-bold mb-2 flex items-center gap-2"><mdi-shield-lock-outline class="inline-block" /> Dynamic ARP Inspection, verified</div>
-  <div class="dim">Managed switches with DAI active — and actually tested against real spoofed ARP traffic, not just assumed to be enforced.</div>
+  <div class="accent font-bold mb-2 flex items-center gap-2"><mdi-shield-lock-outline class="inline-block" /> Dynamic ARP Inspection</div>
+  <div class="dim">Managed switches with DAI active, blocking forged ARP replies before they reach the cache.</div>
 </div>
 
 <div class="card">
@@ -713,10 +652,6 @@ transition: zoom-out
 Land this constructively — after the demo, the room's attention is on "how
 exposed am I," so this is the slide that actually earns its place. Don't
 rush it just because it feels like a formality.
-
-The DAI bullet is a deliberate callback to the field story: assuming a
-control is enforced isn't the same as confirming it is — that gap is the
-actual lesson from testing against a network believed to have DAI on.
 -->
 
 ---
