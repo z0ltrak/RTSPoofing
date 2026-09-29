@@ -474,15 +474,15 @@ transition: fade
 
 # Phase 2: The MITM proxy
 
-<div class="mt-8 text-center">
+<div class="mt-4 text-center">
   The proxy does <strong>three things at once</strong>:
 </div>
 
-<div class="mt-10 grid grid-cols-3 gap-6">
+<div class="mt-6 grid grid-cols-3 gap-6">
 
 <v-click>
 <div class="card">
-  <div class="text-5xl mb-4">①</div>
+  <div class="text-4xl mb-2">①</div>
   <div class="font-bold text-xl mb-3 accent">Transparent relay</div>
   <ul class="text-sm space-y-2 text-left">
     <li>• Intercepts <code>DESCRIBE</code>, <code>SETUP</code>, <code>PLAY</code></li>
@@ -495,12 +495,12 @@ transition: fade
 
 <v-click>
 <div class="card">
-  <div class="text-5xl mb-4">②</div>
+  <div class="text-4xl mb-2">②</div>
   <div class="font-bold text-xl mb-3 accent">Live RTP probing</div>
   <ul class="text-sm space-y-2 text-left">
     <li>• Analyzes the first frames in real time</li>
     <li>• Detects PT, SSRC, codec (H.264/H.265), FPS</li>
-    <li class="dim text-xs">(FPS trick: 90kHz clock ÷ timestamp delta — no metadata needed)</li>
+    <li class="dim text-xs">(FPS trick: 90kHz clock ÷ timestamp delta)</li>
     <li class="good font-medium">→ Zero manual configuration</li>
   </ul>
 </div>
@@ -508,7 +508,7 @@ transition: fade
 
 <v-click>
 <div class="card">
-  <div class="text-5xl mb-4">③</div>
+  <div class="text-4xl mb-2">③</div>
   <div class="font-bold text-xl mb-3 accent">Injection channel</div>
   <ul class="text-sm space-y-2 text-left">
     <li>• Stream flows normally at first...</li>
