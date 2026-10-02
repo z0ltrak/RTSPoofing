@@ -137,7 +137,7 @@ transition: fade
 And who can say exactly what those cameras are sending?
 </div>
 <div class="mt-6 flex justify-center">
-  <img src="/gifs/cat-stare.gif" class="rounded-lg" style="height:160px"/>
+  <img src="/img/cam1.jpeg" class="rounded-lg" style="height:160px"/>
 </div>
 </v-click>
 
@@ -562,7 +562,7 @@ Same protocol. Same parameters. Same apparent source.
 
 <v-click>
 <div class="flex justify-center mt-6">
-  <img src="/gifs/cat-happy.gif" class="rounded-lg" style="height:150px"/>
+  <img src="/img/cat.jpg" class="rounded-lg" style="height:150px"/>
 </div>
 <div class="mt-3 text-center text-lg dim">
 The NVR: <span class="good">"All normal here. Recording. Nothing to report."</span>
