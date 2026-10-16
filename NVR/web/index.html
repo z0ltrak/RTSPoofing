@@ -203,6 +203,113 @@ function concat(a, b) {
   return out;
 }
 
+// --- Bitstream helpers -----------------------------------------------------
+//
+// Chromium's WebCodecs H.264 decoder works most reliably when configured with
+// an avcC description and fed length-prefixed NAL units (AVCC format). Annex-B
+// mode is spec'd but has had rough edges on Chromium in the past, so we build
+// an avcC record from the SDP-advertised SPS/PPS and convert each access unit
+// before handing it to decode().
+
+// Build an ISO/IEC 14496-15 § 5.2.4.1 AVCDecoderConfigurationRecord.
+function buildAvcC(spsList, ppsList) {
+  if (!spsList || spsList.length === 0) return null;
+  if (!ppsList || ppsList.length === 0) return null;
+  const sps0 = spsList[0];
+  if (sps0.length < 4) return null;
+
+  // Fixed header: version(1) + profile(1) + compat(1) + level(1) +
+  //               lengthSizeMinusOne(1) + numSPS(1) = 6 bytes.
+  let size = 6;
+  for (const s of spsList) size += 2 + s.length;
+  size += 1;  // numPPS byte
+  for (const p of ppsList) size += 2 + p.length;
+
+  const out = new Uint8Array(size);
+  let o = 0;
+  out[o++] = 1;                     // configurationVersion
+  out[o++] = sps0[1];               // AVCProfileIndication
+  out[o++] = sps0[2];               // profile_compatibility
+  out[o++] = sps0[3];               // AVCLevelIndication
+  out[o++] = 0xFF;                  // reserved(6) | lengthSizeMinusOne=3 (4-byte lengths)
+  out[o++] = 0xE0 | (spsList.length & 0x1F);
+  for (const s of spsList) {
+    out[o++] = (s.length >> 8) & 0xFF;
+    out[o++] = s.length & 0xFF;
+    out.set(s, o); o += s.length;
+  }
+  out[o++] = ppsList.length & 0xFF;
+  for (const p of ppsList) {
+    out[o++] = (p.length >> 8) & 0xFF;
+    out[o++] = p.length & 0xFF;
+    out.set(p, o); o += p.length;
+  }
+  return out;
+}
+
+// Scan an Annex-B access unit and return raw NAL unit byte ranges (no start
+// codes). Handles both 3-byte and 4-byte start codes.
+function* iterNalUnits(buf) {
+  const n = buf.length;
+  let i = 0;
+  // Advance to first start code.
+  let nalStart = -1;
+  while (i + 2 < n) {
+    if (buf[i] === 0 && buf[i + 1] === 0) {
+      if (buf[i + 2] === 1) { nalStart = i + 3; i = nalStart; break; }
+      if (i + 3 < n && buf[i + 2] === 0 && buf[i + 3] === 1) {
+        nalStart = i + 4; i = nalStart; break;
+      }
+    }
+    i++;
+  }
+  if (nalStart < 0) return;
+
+  while (i < n) {
+    // Find the next start code.
+    let next = -1;
+    let scLen = 0;
+    let j = i;
+    while (j + 2 < n) {
+      if (buf[j] === 0 && buf[j + 1] === 0) {
+        if (buf[j + 2] === 1) { next = j; scLen = 3; break; }
+        if (j + 3 < n && buf[j + 2] === 0 && buf[j + 3] === 1) {
+          next = j; scLen = 4; break;
+        }
+      }
+      j++;
+    }
+    if (next < 0) {
+      if (n > nalStart) yield buf.subarray(nalStart, n);
+      return;
+    }
+    if (next > nalStart) yield buf.subarray(nalStart, next);
+    nalStart = next + scLen;
+    i = nalStart;
+  }
+}
+
+// Annex-B access unit → AVCC: each NAL prefixed by a 4-byte big-endian length.
+function annexBToAvcc(au) {
+  const nals = [];
+  let total = 0;
+  for (const nal of iterNalUnits(au)) {
+    nals.push(nal);
+    total += 4 + nal.length;
+  }
+  if (nals.length === 0) return new Uint8Array(0);
+  const out = new Uint8Array(total);
+  let o = 0;
+  for (const nal of nals) {
+    out[o++] = (nal.length >>> 24) & 0xFF;
+    out[o++] = (nal.length >>> 16) & 0xFF;
+    out[o++] = (nal.length >>> 8)  & 0xFF;
+    out[o++] =  nal.length         & 0xFF;
+    out.set(nal, o); o += nal.length;
+  }
+  return out;
+}
+
 // --- Local frame-rate / render-side stats ---------------------------------
 
 const local = {
@@ -232,43 +339,81 @@ class Player {
     this.currentEpoch = -1;
     this.currentCodec = null;
     this.waitingForKey = true;
-    this.chunkTs = 0;  // monotonically increasing synthetic timestamp
+    this.chunkTs = 0;             // monotonically increasing synthetic timestamp
+    this.useAvcc = false;         // AVCC (length-prefixed) vs Annex-B input
+    this.isH264 = false;
+    this.isHevc = false;
+    this.hasRenderedFrame = false;  // first output() has fired at least once
+    this.onFirstFrame = null;       // UI callback, set from outside
   }
 
-  buildCodecString(info) {
+  // Try a sequence of codec strings until one is `supported` by this browser.
+  //
+  // Chromium is picky about the profile/level string for H.264 — e.g. a
+  // "high 4:4:4 predictive" SPS triplet from a stream the hardware decoder
+  // actually accepts via a different profile string can be rejected by
+  // isConfigSupported(). We derive one from the SPS and fall back to the
+  // common profile strings so hardware-accelerated decoding can still be
+  // negotiated when the SPS triplet is odd.
+  async pickCodecString(info, description) {
+    const candidates = [];
     if (info.codec === "H264") {
-      // avc1.<profile_idc><constraint><level_idc>, 6 hex chars.
-      if (!info.sps || info.sps.length === 0) return "avc1.42E01E";
-      const sps = b64decode(info.sps[0]);
-      if (sps.length < 4) return "avc1.42E01E";
-      const h = (n) => n.toString(16).padStart(2, "0").toUpperCase();
-      return "avc1." + h(sps[1]) + h(sps[2]) + h(sps[3]);
+      if (info.sps && info.sps.length > 0) {
+        const sps = b64decode(info.sps[0]);
+        if (sps.length >= 4) {
+          const h = (n) => n.toString(16).padStart(2, "0").toUpperCase();
+          candidates.push("avc1." + h(sps[1]) + h(sps[2]) + h(sps[3]));
+        }
+      }
+      // Baseline/Main/High @ L3.1 and L4.0 — the common surveillance presets.
+      candidates.push("avc1.42E01F", "avc1.42E01E",
+                      "avc1.4D401F", "avc1.4D401E",
+                      "avc1.64001F", "avc1.640028");
+    } else if (info.codec === "H265" || info.codec === "HEVC") {
+      candidates.push("hvc1.1.6.L120.90", "hev1.1.6.L120.90",
+                      "hvc1.1.6.L93.90",  "hev1.1.6.L93.90",
+                      "hvc1.1.6.L150.90", "hev1.1.6.L150.90");
+    } else {
+      candidates.push("avc1.42E01E");
     }
-    if (info.codec === "H265" || info.codec === "HEVC") {
-      // Fallback generic HEVC Main profile @ L4.0. Browsers that support
-      // HEVC in WebCodecs tend to accept this; stricter codec strings
-      // would require parsing the VPS/SPS.
-      return "hvc1.1.6.L120.90";
+
+    const tried = new Set();
+    for (const codec of candidates) {
+      if (tried.has(codec)) continue;
+      tried.add(codec);
+      try {
+        const cfg = { codec, optimizeForLatency: true };
+        if (description) cfg.description = description;
+        const probe = await VideoDecoder.isConfigSupported(cfg);
+        if (probe && probe.supported) return codec;
+      } catch (e) { /* try next */ }
     }
-    return "avc1.42E01E";
+    // Nothing probed clean — return the preferred candidate and let
+    // configure() throw with a real error if it genuinely can't decode.
+    return candidates[0];
   }
 
   async configure(info) {
-    const codec = this.buildCodecString(info);
+    this.isH264 = info.codec === "H264";
+    this.isHevc = info.codec === "H265" || info.codec === "HEVC";
 
-    // Probe support before touching the live decoder.
-    try {
-      const probe = await VideoDecoder.isConfigSupported({ codec });
-      if (!probe.supported) {
-        setOverlay("err", "codec not supported by this browser",
-                   codec + " — try Chrome/Edge, or Safari 16.4+");
-        els.k.decoder.textContent = "unsupported";
-        els.k.decoder.className = "v err";
-        return;
+    // For H.264, build an avcC record and feed AVCC length-prefixed NALs:
+    // the most portable WebCodecs path, and the one Chromium handles
+    // reliably across versions. For H.265 we stay in Annex-B mode (hvcC
+    // is fiddly and HEVC WebCodecs support is uneven anyway).
+    let description = null;
+    this.useAvcc = false;
+    if (this.isH264) {
+      const spsList = (info.sps || []).map(b64decode);
+      const ppsList = (info.pps || []).map(b64decode);
+      const avcc = buildAvcC(spsList, ppsList);
+      if (avcc) {
+        description = avcc;
+        this.useAvcc = true;
       }
-    } catch (e) {
-      // isConfigSupported itself may throw on older browsers; try to configure anyway.
     }
+
+    const codec = await this.pickCodecString(info, description);
 
     if (this.decoder) {
       try { this.decoder.close(); } catch (e) {}
@@ -277,7 +422,6 @@ class Player {
 
     this.decoder = new VideoDecoder({
       output: (frame) => {
-        // Match canvas to native frame size on first/changed frame.
         if (frame.displayWidth !== els.canvas.width ||
             frame.displayHeight !== els.canvas.height) {
           els.canvas.width = frame.displayWidth;
@@ -286,6 +430,10 @@ class Player {
         try {
           ctx.drawImage(frame, 0, 0, els.canvas.width, els.canvas.height);
           local.pushFrame();
+          if (!this.hasRenderedFrame) {
+            this.hasRenderedFrame = true;
+            if (this.onFirstFrame) this.onFirstFrame();
+          }
         } catch (e) {
           console.error("drawImage", e);
         } finally {
@@ -294,25 +442,43 @@ class Player {
       },
       error: (e) => {
         console.error("VideoDecoder error", e);
-        // Non-fatal: mark decoder bad, wait for the next CONFIG epoch or keyframe.
-        els.k.decoder.textContent = "error";
+        els.k.decoder.textContent = "error: " + (e && e.message || e);
         els.k.decoder.className = "v err";
         this.waitingForKey = true;
       },
     });
 
-    this.decoder.configure({
+    const cfg = {
       codec,
       optimizeForLatency: true,
       hardwareAcceleration: "prefer-hardware",
-      // No `description` → the decoder reads Annex-B start codes directly.
-    });
+    };
+    if (description) cfg.description = description;
+
+    try {
+      this.decoder.configure(cfg);
+    } catch (e) {
+      // Common Chromium failure: strict codec string rejection. Retry once
+      // with hardwareAcceleration omitted so the software decoder is also
+      // considered.
+      console.warn("configure failed, retrying without HW pref:", e);
+      try {
+        delete cfg.hardwareAcceleration;
+        this.decoder.configure(cfg);
+      } catch (e2) {
+        setOverlay("err", "decoder configure failed",
+                   codec + " — " + (e2 && e2.message || e2));
+        els.k.decoder.textContent = "config failed";
+        els.k.decoder.className = "v err";
+        return;
+      }
+    }
 
     this.currentEpoch = info.epoch;
     this.currentCodec = codec;
     this.waitingForKey = true;
 
-    els.k.codec.textContent = codec;
+    els.k.codec.textContent = codec + (this.useAvcc ? " · avcC" : " · annex-b");
     els.k.decoder.textContent = "ready";
     els.k.decoder.className = "v good";
   }
@@ -323,11 +489,15 @@ class Player {
     if (this.waitingForKey && !isKeyframe) return;
     this.waitingForKey = false;
 
+    // Convert to the format the decoder was configured for.
+    const payload = this.useAvcc ? annexBToAvcc(data) : data;
+    if (payload.length === 0) return;
+
     try {
       const chunk = new EncodedVideoChunk({
         type: isKeyframe ? "key" : "delta",
         timestamp: this.chunkTs,
-        data,
+        data: payload,
       });
       // 33 ms synthetic step — WebCodecs doesn't act on this value for
       // display, it just has to be monotonically increasing.
@@ -360,8 +530,17 @@ async function runOnce(player) {
   setOverlay("", "awaiting keyframe…", "");
   setBadge("warn", "awaiting keyframe");
 
+  // Clear overlay the moment the decoder actually produces a picture — a
+  // keyframe arriving on the wire is not enough on its own; the browser
+  // may still fail to decode it (unsupported profile, bad SPS). Hooking
+  // the output callback is the only reliable signal.
+  player.hasRenderedFrame = false;
+  player.onFirstFrame = () => {
+    setOverlay(null);
+    setBadge("live", "live");
+  };
+
   let buf = new Uint8Array(0);
-  let gotFirstFrame = false;
 
   while (true) {
     const { done, value } = await reader.read();
@@ -384,11 +563,6 @@ async function runOnce(player) {
           const isKey = payload[0] === 1;
           const au = payload.subarray(1);
           player.decodeAccessUnit(au, isKey);
-          if (!gotFirstFrame && isKey) {
-            gotFirstFrame = true;
-            setOverlay(null);
-            setBadge("live", "live");
-          }
         }
       } else if (type === MSG_STATUS) {
         try {

@@ -151,6 +151,10 @@ class NvrWebServer:
         self._clients_lock = threading.Lock()
         self._latest_config: Optional[bytes] = None
         self._latest_status: Optional[bytes] = None
+        # Most-recent keyframe access unit, replayed to brand-new clients so
+        # they don't have to sit on "awaiting keyframe" for a full GOP. Cleared
+        # on epoch change: an old keyframe is useless under new SPS/PPS.
+        self._latest_keyframe: Optional[bytes] = None
         self._epoch = 0
         self._server: Optional[_ThreadingHTTPServer] = None
         self._thread: Optional[threading.Thread] = None
@@ -200,6 +204,10 @@ class NvrWebServer:
         msg = _frame(MSG_CONFIG, payload)
         with self._clients_lock:
             self._latest_config = msg
+            # New codec parameters invalidate the cached keyframe — it was
+            # encoded under the previous SPS/PPS and a new client decoding it
+            # against the fresh config would get corrupted output.
+            self._latest_keyframe = None
             for c in self._clients:
                 c.push_control(msg)
 
@@ -210,6 +218,8 @@ class NvrWebServer:
         payload = bytes([1 if is_keyframe else 0]) + access_unit
         msg = _frame(MSG_VIDEO, payload)
         with self._clients_lock:
+            if is_keyframe:
+                self._latest_keyframe = msg
             for c in self._clients:
                 c.push_video(msg)
 
@@ -237,6 +247,13 @@ class NvrWebServer:
                 c.push_control(self._latest_config)
             if self._latest_status is not None:
                 c.push_control(self._latest_status)
+            # Replay the most recent keyframe so the decoder has something
+            # valid to render on before the next in-stream keyframe lands.
+            # Without this, joining mid-GOP leaves the viewer stuck on
+            # "awaiting keyframe" until the camera's next IDR — easily
+            # several seconds.
+            if self._latest_keyframe is not None:
+                c.push_video(self._latest_keyframe)
             self._clients.append(c)
         log.info("web client connected (total=%d)", len(self._clients))
 
