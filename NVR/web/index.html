@@ -104,6 +104,47 @@
     border: 1px solid rgba(255,255,255,0.06);
     pointer-events: none;
   }
+  #debug-toggle {
+    position: absolute;
+    right: 12px; top: 12px;
+    font-size: 11px;
+    color: var(--muted);
+    text-transform: uppercase;
+    background: var(--panel);
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.06);
+    cursor: pointer;
+    user-select: none;
+    z-index: 10;
+  }
+  #debug-toggle:hover { color: var(--fg); }
+  #debug {
+    position: absolute;
+    right: 12px; top: 48px;
+    width: min(520px, calc(100vw - 24px));
+    max-height: 45vh;
+    overflow-y: auto;
+    background: var(--panel);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--fg);
+    z-index: 9;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #debug.hidden { display: none; }
+  #debug .l-info { color: var(--muted); }
+  #debug .l-ok   { color: var(--accent); }
+  #debug .l-warn { color: var(--warn); }
+  #debug .l-err  { color: var(--err); }
+  #debug .ts { color: #4a4e58; margin-right: 6px; }
   #title .dot {
     display: inline-block;
     width: 7px; height: 7px;
@@ -120,6 +161,8 @@
 </head>
 <body>
 <div id="title"><span class="dot"></span><span id="title-text">starting</span></div>
+<div id="debug-toggle" title="toggle diagnostic log">diag</div>
+<div id="debug"></div>
 <div id="stage"><canvas id="canvas" width="640" height="360"></canvas></div>
 <div id="overlay">
   <div class="spinner"></div>
@@ -168,6 +211,39 @@ const els = {
 };
 
 const ctx = els.canvas.getContext("2d", { alpha: false, desynchronized: true });
+
+// --- Debug log panel ------------------------------------------------------
+// Visible under the "diag" button in the top-right. Mirrors to console too.
+// The user doesn't need devtools to tell us why decoding is failing — the
+// last 200 lines of state transitions, codec probes, and decoder errors
+// are right there on the page.
+
+const debugEl = document.getElementById("debug");
+const debugToggle = document.getElementById("debug-toggle");
+
+// Open on load for first-run diagnostics; the user can click "diag" to hide.
+let debugOpen = true;
+const applyDebugVisibility = () => {
+  if (debugOpen) debugEl.classList.remove("hidden");
+  else           debugEl.classList.add("hidden");
+};
+applyDebugVisibility();
+debugToggle.addEventListener("click", () => { debugOpen = !debugOpen; applyDebugVisibility(); });
+
+const DBG_MAX = 200;
+function dlog(level, msg) {
+  const ts = new Date().toISOString().slice(11, 23);
+  const line = document.createElement("div");
+  line.className = "l-" + level;
+  line.innerHTML = '<span class="ts">' + ts + "</span>" +
+                   msg.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  debugEl.appendChild(line);
+  while (debugEl.childNodes.length > DBG_MAX) debugEl.removeChild(debugEl.firstChild);
+  debugEl.scrollTop = debugEl.scrollHeight;
+  const fn = level === "err" ? "error" : level === "warn" ? "warn" : "log";
+  console[fn]("[nvr]", msg);
+}
+dlog("info", "viewer loaded; user agent: " + navigator.userAgent);
 
 // --- UI helpers -----------------------------------------------------------
 
@@ -392,6 +468,7 @@ class Player {
     }
 
     const tried = new Set();
+    const results = [];
     for (const codec of candidates) {
       if (tried.has(codec)) continue;
       tried.add(codec);
@@ -399,11 +476,20 @@ class Player {
         const cfg = { codec, optimizeForLatency: true };
         if (description) cfg.description = description;
         const probe = await VideoDecoder.isConfigSupported(cfg);
-        if (probe && probe.supported) return codec;
-      } catch (e) { /* try next */ }
+        results.push(codec + "=" + (probe && probe.supported ? "yes" : "no"));
+        if (probe && probe.supported) {
+          dlog("ok", "codec probe → " + codec + " supported (" + results.join(", ") + ")");
+          return codec;
+        }
+      } catch (e) {
+        results.push(codec + "=throw(" + (e && e.message || e) + ")");
+      }
     }
-    // Nothing probed clean — return the preferred candidate and let
-    // configure() throw with a real error if it genuinely can't decode.
+    dlog("err", "no supported H.264/H.265 codec string found: " + results.join(", "));
+    dlog("err", "this browser probably lacks the needed decoder — try Chrome stable or Firefox. "
+              + "(Chromium on Linux ships without H.264 unless the chromium-codecs-ffmpeg-extra "
+              + "package is installed.)");
+    // Return the preferred candidate so configure() produces a concrete error.
     return candidates[0];
   }
 
@@ -444,18 +530,21 @@ class Player {
         try {
           ctx.drawImage(frame, 0, 0, els.canvas.width, els.canvas.height);
           local.pushFrame();
+          this.framesSinceConfig = (this.framesSinceConfig || 0) + 1;
           if (!this.hasRenderedFrame) {
             this.hasRenderedFrame = true;
+            dlog("ok", "first frame rendered: "
+                     + frame.displayWidth + "x" + frame.displayHeight);
             if (this.onFirstFrame) this.onFirstFrame();
           }
         } catch (e) {
-          console.error("drawImage", e);
+          dlog("err", "drawImage threw: " + (e && e.message || e));
         } finally {
           frame.close();
         }
       },
       error: (e) => {
-        console.error("VideoDecoder error", e);
+        dlog("err", "VideoDecoder.onerror: " + (e && e.message || e));
         els.k.decoder.textContent = "error: " + (e && e.message || e);
         els.k.decoder.className = "v err";
         this.waitingForKey = true;
@@ -469,17 +558,20 @@ class Player {
     };
     if (description) cfg.description = description;
 
+    dlog("info", "configure: codec=" + codec
+                + " avcc=" + this.useAvcc
+                + " desc=" + (description ? description.length + "B" : "none")
+                + " hw=prefer-hardware");
     try {
       this.decoder.configure(cfg);
     } catch (e) {
-      // Common Chromium failure: strict codec string rejection. Retry once
-      // with hardwareAcceleration omitted so the software decoder is also
-      // considered.
-      console.warn("configure failed, retrying without HW pref:", e);
+      dlog("warn", "configure(prefer-hardware) threw: " + (e && e.message || e)
+                 + " — retrying without hardwareAcceleration");
       try {
         delete cfg.hardwareAcceleration;
         this.decoder.configure(cfg);
       } catch (e2) {
+        dlog("err", "configure(any) threw: " + (e2 && e2.message || e2));
         setOverlay("err", "decoder configure failed",
                    codec + " — " + (e2 && e2.message || e2));
         els.k.decoder.textContent = "config failed";
@@ -491,10 +583,14 @@ class Player {
     this.currentEpoch = info.epoch;
     this.currentCodec = codec;
     this.waitingForKey = true;
+    this.chunksSentSinceConfig = 0;
+    this.framesSinceConfig = 0;
+    this.watchdogWarned = false;
 
     els.k.codec.textContent = codec + (this.useAvcc ? " · avcC" : " · annex-b");
     els.k.decoder.textContent = "ready";
     els.k.decoder.className = "v good";
+    dlog("ok", "decoder ready; waiting for first keyframe");
   }
 
   decodeAccessUnit(data, isKeyframe) {
@@ -531,8 +627,27 @@ class Player {
       // display, it just has to be monotonically increasing.
       this.chunkTs += 33333;
       this.decoder.decode(chunk);
+      this.chunksSentSinceConfig++;
+      if (effectiveKey && this.chunksSentSinceConfig <= 2) {
+        dlog("ok", "sent " + (effectiveKey ? "KEY" : "delta") + " chunk #"
+                 + this.chunksSentSinceConfig + " to decoder (" + payload.length + "B)");
+      }
+      // Watchdog: 60 chunks in, 0 frames out → decoder is swallowing input.
+      // Common cause: Chromium accepted the codec string via isConfigSupported
+      // but the underlying ffmpeg decoder can't actually decode this stream.
+      if (!this.watchdogWarned
+          && this.chunksSentSinceConfig >= 60
+          && this.framesSinceConfig === 0) {
+        this.watchdogWarned = true;
+        dlog("err", "decoder accepted " + this.chunksSentSinceConfig
+                   + " chunks but produced 0 frames. "
+                   + "Likely the browser lacks a working H.264 decoder. "
+                   + "On Linux Chromium, try: apt install chromium-codecs-ffmpeg-extra");
+        setOverlay("err", "decoder is swallowing input",
+                   "60+ chunks accepted, 0 frames produced — see the diag panel");
+      }
     } catch (e) {
-      console.error("decode failed", e);
+      dlog("err", "decode() threw: " + (e && e.message || e));
       this.waitingForKey = true;
     }
   }
@@ -633,11 +748,48 @@ function handleStatus(s) {
 
 async function main() {
   if (typeof VideoDecoder === "undefined") {
+    dlog("err", "VideoDecoder is undefined — this browser has no WebCodecs API");
     setOverlay("err", "this browser has no WebCodecs API",
                "use Chrome 94+, Edge 94+, Safari 16.4+, or Firefox 130+");
     setBadge("err", "unsupported");
     return;
   }
+
+  // Upfront probe so the "does this browser decode H.264 at all" question is
+  // answered before we see any stream — a huge amount of "stuck at awaiting
+  // keyframe" turns out to be Chromium builds (incl. Linux distro Chromium)
+  // shipping without H.264 support.
+  dlog("info", "probing browser codec support…");
+  const commonH264 = ["avc1.42E01E", "avc1.42E01F", "avc1.4D401E",
+                      "avc1.4D401F", "avc1.64001E", "avc1.640028"];
+  let anyH264 = false;
+  for (const c of commonH264) {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ codec: c });
+      dlog(r && r.supported ? "ok" : "info", "  " + c + " → " + (r && r.supported ? "supported" : "no"));
+      if (r && r.supported) anyH264 = true;
+    } catch (e) {
+      dlog("warn", "  " + c + " → threw " + (e && e.message || e));
+    }
+  }
+  if (!anyH264) {
+    dlog("err", "no H.264 profile is supported by this browser's WebCodecs.");
+    dlog("err", "likely cause: Chromium on Linux ships without the proprietary "
+              + "H.264 codec. Fix: `sudo apt install chromium-codecs-ffmpeg-extra` "
+              + "(Debian/Ubuntu) and restart the browser; or use Google Chrome, "
+              + "Firefox 130+, or Edge instead of Chromium.");
+    setOverlay("err", "no H.264 decoder in this browser",
+               "see diag panel; install chromium-codecs-ffmpeg-extra or use Chrome/Firefox");
+    setBadge("err", "no h.264");
+    return;
+  }
+  const h265 = await (async () => {
+    try {
+      const r = await VideoDecoder.isConfigSupported({ codec: "hvc1.1.6.L120.90" });
+      return r && r.supported;
+    } catch (e) { return false; }
+  })();
+  dlog("info", "codec summary: H.264=yes, H.265=" + (h265 ? "yes" : "no"));
 
   const player = new Player();
 
