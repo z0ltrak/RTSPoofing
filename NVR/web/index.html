@@ -68,6 +68,55 @@
   @keyframes spin { to { transform: rotate(360deg); } }
   #overlay .sub { color: var(--muted); font-size: 13px; }
 
+  /* Non-covering reconnect indicator. Shown instead of the full overlay
+     once we've rendered at least one frame, so the frozen last frame
+     stays visible under it. */
+  #ribbon {
+    position: absolute;
+    top: 48px;
+    left: 50%;
+    transform: translate(-50%, -6px);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--panel);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border: 1px solid rgba(255,255,255,0.08);
+    color: var(--fg);
+    padding: 7px 14px 7px 10px;
+    border-radius: 999px;
+    font-size: 12px;
+    font-weight: 500;
+    letter-spacing: 0.01em;
+    box-shadow: 0 6px 18px rgba(0,0,0,0.35);
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 220ms ease-out, transform 220ms ease-out;
+    z-index: 8;
+    max-width: calc(100vw - 48px);
+  }
+  #ribbon.show { opacity: 1; transform: translate(-50%, 0); }
+  #ribbon .pulse {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--warn);
+    box-shadow: 0 0 0 0 rgba(255, 180, 84, 0.7);
+    animation: ribbon-pulse 1400ms ease-out infinite;
+  }
+  #ribbon.err .pulse { background: var(--err); animation: none; }
+  #ribbon .sub { color: var(--muted); margin-left: 4px; }
+  @keyframes ribbon-pulse {
+    0%   { box-shadow: 0 0 0 0 rgba(255, 180, 84, 0.55); }
+    70%  { box-shadow: 0 0 0 10px rgba(255, 180, 84, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(255, 180, 84, 0); }
+  }
+
+  /* While a reconnect is in flight after we already have a frame, dim
+     the canvas slightly so the user feels "this is paused" without
+     covering it. */
+  canvas.frozen { filter: brightness(0.78) saturate(0.85); transition: filter 240ms ease-out; }
+
   #stats {
     position: absolute;
     left: 12px; right: 12px; bottom: 12px;
@@ -164,6 +213,11 @@
 <div id="debug-toggle" title="toggle diagnostic log">diag</div>
 <div id="debug"></div>
 <div id="stage"><canvas id="canvas" width="640" height="360"></canvas></div>
+<div id="ribbon">
+  <span class="pulse"></span>
+  <span id="ribbon-text">reconnecting</span>
+  <span class="sub" id="ribbon-sub"></span>
+</div>
 <div id="overlay">
   <div class="spinner"></div>
   <div id="overlay-text">connecting to NVR…</div>
@@ -194,6 +248,9 @@ const els = {
   overlay:  document.getElementById("overlay"),
   oText:    document.getElementById("overlay-text"),
   oSub:     document.getElementById("overlay-sub"),
+  ribbon:   document.getElementById("ribbon"),
+  rText:    document.getElementById("ribbon-text"),
+  rSub:     document.getElementById("ribbon-sub"),
   title:    document.getElementById("title"),
   titleTxt: document.getElementById("title-text"),
   k: {
@@ -263,6 +320,29 @@ function setOverlay(mode, text, sub) {
   els.overlay.classList.remove("hidden");
   els.oText.textContent = text || "";
   els.oSub.textContent = sub || "";
+}
+
+// Lightweight non-covering reconnect indicator. Used once we already have a
+// frame on canvas, so the frozen last frame stays visible under it.
+let ribbonHideTimer = null;
+function showRibbon(mode, text, sub) {
+  if (ribbonHideTimer) { clearTimeout(ribbonHideTimer); ribbonHideTimer = null; }
+  els.ribbon.className = (mode === "err" ? "err " : "") + "show";
+  els.rText.textContent = text || "";
+  els.rSub.textContent = sub ? "· " + sub : "";
+  els.canvas.classList.add("frozen");
+}
+function hideRibbon(delayMs) {
+  const run = () => {
+    els.ribbon.classList.remove("show");
+    els.canvas.classList.remove("frozen");
+  };
+  if (delayMs && delayMs > 0) {
+    if (ribbonHideTimer) clearTimeout(ribbonHideTimer);
+    ribbonHideTimer = setTimeout(() => { ribbonHideTimer = null; run(); }, delayMs);
+  } else {
+    run();
+  }
 }
 
 function b64decode(s) {
@@ -434,7 +514,8 @@ class Player {
     this.isH264 = false;
     this.isHevc = false;
     this.hasRenderedFrame = false;  // first output() has fired at least once
-    this.onFirstFrame = null;       // UI callback, set from outside
+    this.onFirstFrame = null;       // UI callback, fired exactly once
+    this.onEveryFrame = null;       // UI callback, fired on every rendered frame
   }
 
   // Try a sequence of codec strings until one is `supported` by this browser.
@@ -537,6 +618,7 @@ class Player {
                      + frame.displayWidth + "x" + frame.displayHeight);
             if (this.onFirstFrame) this.onFirstFrame();
           }
+          if (this.onEveryFrame) this.onEveryFrame();
         } catch (e) {
           dlog("err", "drawImage threw: " + (e && e.message || e));
         } finally {
@@ -663,24 +745,45 @@ class Player {
 // --- /stream reader --------------------------------------------------------
 
 async function runOnce(player) {
-  setOverlay("", "connecting to NVR…", "");
+  // Prefer the smooth ribbon over the full overlay once we've ever rendered.
+  if (player.hasRenderedFrame) {
+    showRibbon("warn", "reconnecting", "connecting to NVR");
+  } else {
+    setOverlay("", "connecting to NVR…", "");
+  }
   setBadge("", "connecting");
   const resp = await fetch("/stream");
   if (!resp.ok) throw new Error("HTTP " + resp.status);
   if (!resp.body) throw new Error("stream has no body");
   const reader = resp.body.getReader();
 
-  setOverlay("", "awaiting keyframe…", "");
+  if (player.hasRenderedFrame) {
+    showRibbon("warn", "awaiting keyframe", "");
+  } else {
+    setOverlay("", "awaiting keyframe…", "");
+  }
   setBadge("warn", "awaiting keyframe");
 
   // Clear overlay the moment the decoder actually produces a picture — a
   // keyframe arriving on the wire is not enough on its own; the browser
   // may still fail to decode it (unsupported profile, bad SPS). Hooking
   // the output callback is the only reliable signal.
-  player.hasRenderedFrame = false;
+  //
+  // Only reset hasRenderedFrame if we've never had a picture; otherwise
+  // keep the last frame visible across browser-level fetch reconnects.
   player.onFirstFrame = () => {
     setOverlay(null);
+    hideRibbon();
     setBadge("live", "live");
+  };
+  // After a mid-stream RTSP reconnect, a new frame means "live again".
+  // Install a per-frame hook so the ribbon drops immediately once decoding
+  // actually resumes, not just when the server says state=streaming.
+  player.onEveryFrame = () => {
+    if (els.ribbon.classList.contains("show")) {
+      hideRibbon();
+      setBadge("live", "live");
+    }
   };
 
   let buf = new Uint8Array(0);
@@ -721,15 +824,33 @@ async function runOnce(player) {
 function handleStatus(s) {
   if (s.state) {
     els.k.state.textContent = s.state;
-    if (s.state === "streaming")      els.k.state.className = "v good";
-    else if (s.state === "connecting"
-          || s.state === "reconnecting") {
+    const havePicture = !!(window._player && window._player.hasRenderedFrame);
+    if (s.state === "streaming") {
+      els.k.state.className = "v good";
+      // Delay-hide the ribbon so the "reconnecting" indicator doesn't
+      // flicker off before the first new frame actually arrives.
+    } else if (s.state === "connecting" || s.state === "reconnecting") {
       els.k.state.className = "v warn";
       setBadge("warn", s.state);
-      setOverlay("warn", s.state + "…",
-                 s.detail || "the NVR is reaching the camera again");
-    } else if (s.state === "error")   els.k.state.className = "v err";
-    else                              els.k.state.className = "v";
+      if (havePicture) {
+        // Smooth path: keep the last frame visible, show only a small pill.
+        showRibbon("warn", s.state, s.detail || "");
+      } else {
+        // First connect / never seen a frame — the big overlay is warranted.
+        setOverlay("warn", s.state + "…",
+                   s.detail || "the NVR is reaching the camera");
+      }
+    } else if (s.state === "error") {
+      els.k.state.className = "v err";
+      setBadge("err", "error");
+      if (havePicture) {
+        showRibbon("err", "error", s.detail || "stream unavailable");
+      } else {
+        setOverlay("err", "stream unavailable", s.detail || "");
+      }
+    } else {
+      els.k.state.className = "v";
+    }
   }
   if (s.ssrc !== undefined)       els.k.ssrc.textContent = s.ssrc;
   if (s.rtp_packets !== undefined) els.k.rtp.textContent = s.rtp_packets.toLocaleString();
@@ -792,6 +913,10 @@ async function main() {
   dlog("info", "codec summary: H.264=yes, H.265=" + (h265 ? "yes" : "no"));
 
   const player = new Player();
+  // Expose for handleStatus(); the status handler is a free function and
+  // needs to know whether a picture has ever rendered, to pick between the
+  // smooth ribbon and the full overlay.
+  window._player = player;
 
   // Local-render FPS tick (independent of server status cadence).
   setInterval(() => {
@@ -806,10 +931,15 @@ async function main() {
     try {
       await runOnce(player);
     } catch (e) {
-      console.warn("stream dropped:", e && e.message);
+      dlog("warn", "stream dropped: " + (e && e.message));
       setBadge("err", "nvr unreachable");
-      setOverlay("err", "NVR unreachable",
-                 "retrying in " + (delay / 1000).toFixed(1) + "s — is the NVR process running?");
+      const sub = "retrying in " + (delay / 1000).toFixed(1) + "s";
+      if (player.hasRenderedFrame) {
+        showRibbon("err", "NVR unreachable", sub);
+      } else {
+        setOverlay("err", "NVR unreachable",
+                   sub + " — is the NVR process running?");
+      }
     }
     await new Promise((r) => setTimeout(r, delay));
     // Exponential backoff capped at 5s so we don't hammer the server.
