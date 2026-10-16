@@ -234,7 +234,12 @@ while true; do
     ffplay -rtsp_transport tcp "rtsp://user:pass@<CAMERA_IP>:554/stream"
     sleep 2
 done
+
+#or
+python3 NVR/nvr.py --url 'rtsp://admin:L21B74E2@192.168.1.108/cam/realmonitor?channel=1&subtype=1' --no-display --sserve 8080
+
 ```
+
 
 Or, for a demo that also records the viewer-side stream and surfaces the
 on-wire state (SSRC, RTP media-clock vs. wall-clock drift, keyframe cadence),
