@@ -236,7 +236,7 @@ while true; do
 done
 
 #or
-python3 NVR/nvr.py --url 'rtsp://admin:L21B74E2@192.168.1.108/cam/realmonitor?channel=1&subtype=1' --no-display --sserve 8080
+python3 NVR/nvr.py --url 'rtsp://admin:L21B74E2@192.168.1.108/cam/realmonitor?channel=1&subtype=1' --no-display --serve 8080
 
 ```
 
