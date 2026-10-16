@@ -17,10 +17,47 @@ stream, and from there:
 - optionally dumps a `.rtp` capture in **the proxy's own binary format**, so
   the file is directly loop-injectable with `rtspoofing --mode inject`.
 
-A one-line live status is printed to stderr while the stream is running:
+Three viewer sinks are available, independently toggleable:
+
+| Sink | Flag | Latency | Reconnect-friendly |
+|---|---|---|---|
+| Browser (WebCodecs) | `--serve PORT` | ~50-100 ms localhost | **Stays open across RTSP reconnects** |
+| ffplay subprocess | default (disable with `--no-display`) | ~100-200 ms | New window per reconnect |
+| MP4 recorder | `--record-mp4` | n/a | File rotated per reconnect |
+
+A one-line live status is also printed to stderr while the stream runs:
 frames received, SSRC, RTP media-clock time, wall-clock elapsed, and the
 drift between the two — the quantities that make injection/replay visible
 on a running demo.
+
+## Browser viewer (recommended)
+
+```bash
+python3 nvr.py \
+  --url 'rtsp://admin:L21B74E2@192.168.1.108:554/cam/realmonitor?channel=1&subtype=0' \
+  --no-display --serve 8080
+```
+
+Open **http://127.0.0.1:8080** in Chrome, Edge, Safari 16.4+, or Firefox 130+.
+The page decodes H.264/H.265 directly on a `<canvas>` via the browser's
+WebCodecs API (hardware-accelerated where available), overlays a stats panel
+with the same quantities as the stderr line, and reconnects on its own:
+
+- If the RTSP side flaps, the server pushes a new `CONFIG` + status; the
+  canvas keeps the last frame and shows a muted "reconnecting" overlay
+  until the next keyframe arrives. The browser tab never reloads.
+- If the NVR process itself goes down, the browser retries `/stream` with
+  exponential back-off capped at 5 s and re-attaches to the same canvas
+  once the NVR is back.
+
+The transport is a single long-lived HTTP chunked response at `/stream`
+carrying a 5-byte-framed binary protocol — no WebSocket, no external JS
+libraries, no pip dependencies. The whole viewer is `web_server.py`
+(~250 lines of stdlib) and `web/index.html` (~290 lines, inline JS).
+
+`--serve` accepts `8080`, `':8080'`, or `'host:port'` (default host:
+`127.0.0.1`; use `0.0.0.0:8080` to let other machines on the lab LAN view
+the stream too — useful for a demo on a projector).
 
 ## Reconnect behaviour
 
@@ -123,8 +160,15 @@ conversion:
   start codes, with the SDP-advertised SPS/PPS (and VPS for HEVC) prepended
   once so the decoder can start before the first in-band parameter set.
 - `nvr.py` — the orchestrator: brings up the RTSP session, fans the
-  depacketized stream out to `ffplay` and/or `ffmpeg`, writes the `.rtp`
-  capture, prints the live stats line, tears everything down on SIGINT.
+  depacketized stream out to `ffplay`, `ffmpeg`, the `.rtp` capture, and
+  the web server; accumulates NAL units into access units for the web
+  viewer; prints the live stats line; runs the outer reconnect loop.
+- `web_server.py` — threaded `http.server` with HTTP-chunked streaming
+  on `/stream`. Fans one broadcast out to N connected browsers; drops
+  VIDEO on queue-full so a slow browser can't back the RTSP side up.
+- `web/index.html` — single-file browser viewer. WebCodecs `VideoDecoder`
+  for H.264/H.265, canvas rendering, live stats panel, in-browser
+  reconnect loop with exponential back-off. No external dependencies.
 
 ## Scope and non-goals
 

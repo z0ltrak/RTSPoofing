@@ -41,6 +41,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rtp_depay import RtpDepayH264, RtpDepayH265, parse_rtp  # noqa: E402
 from rtsp_client import RtspClient, RtspError, iter_interleaved  # noqa: E402
+from web_server import NvrWebServer  # noqa: E402
 
 
 log = logging.getLogger("nvr")
@@ -197,27 +198,44 @@ class LiveStats:
     ssrc: int = 0
     last_print: float = 0.0
 
+    def snapshot(self) -> Optional[dict]:
+        """Compute a stats dict suitable for publishing to the viewer, or None
+        if we haven't seen the first packet yet."""
+        if self.first_wallclock == 0.0:
+            return None
+        elapsed = max(1e-6, time.time() - self.first_wallclock)
+        rtp_elapsed = ((self.last_rtp_ts - self.first_rtp_ts) & 0xFFFFFFFF) / 90000.0
+        return {
+            "ssrc": f"0x{self.ssrc:08x}",
+            "rtp_packets": self.rtp_packets,
+            "nalus": self.nalus,
+            "keyframes": self.keyframes,
+            "wall_s": round(elapsed, 2),
+            "media_clock_s": round(rtp_elapsed, 2),
+            "drift": round(rtp_elapsed - elapsed, 3),
+            "kbps": round((self.bytes_in * 8) / 1000 / elapsed, 1),
+            "fps": round(self.rtp_packets / elapsed, 2),
+            "state": "streaming",
+        }
+
     def tick(self, interval: float = 1.0) -> Optional[str]:
         now = time.monotonic()
         if now - self.last_print < interval:
             return None
         self.last_print = now
-        if self.first_wallclock == 0.0:
+        snap = self.snapshot()
+        if snap is None:
             return None
-        elapsed = max(1e-6, time.time() - self.first_wallclock)
-        kbps = (self.bytes_in * 8) / 1000 / elapsed
-        fps_live = self.rtp_packets / elapsed
-        rtp_elapsed_s = ((self.last_rtp_ts - self.first_rtp_ts) & 0xFFFFFFFF) / 90000.0
         return (
-            f"ssrc=0x{self.ssrc:08x}  "
-            f"rtp={self.rtp_packets:>6}  "
-            f"nalus={self.nalus:>6}  "
-            f"keyframes={self.keyframes:>3}  "
-            f"wall={elapsed:7.1f}s  "
-            f"media_clock={rtp_elapsed_s:7.1f}s  "
-            f"drift={rtp_elapsed_s - elapsed:+6.2f}s  "
-            f"bitrate={kbps:7.0f}kbps  "
-            f"rate={fps_live:5.1f}pkt/s"
+            f"ssrc={snap['ssrc']}  "
+            f"rtp={snap['rtp_packets']:>6}  "
+            f"nalus={snap['nalus']:>6}  "
+            f"keyframes={snap['keyframes']:>3}  "
+            f"wall={snap['wall_s']:7.1f}s  "
+            f"media_clock={snap['media_clock_s']:7.1f}s  "
+            f"drift={snap['drift']:+6.2f}s  "
+            f"bitrate={snap['kbps']:7.0f}kbps  "
+            f"rate={snap['fps']:5.1f}pkt/s"
         )
 
 
@@ -240,7 +258,11 @@ def _rotate_path(base: Optional[str], attempt: int) -> Optional[str]:
     return str(p.with_name(f"{p.stem}.{attempt:03d}{p.suffix}"))
 
 
-def run_once(args: argparse.Namespace, attempt: int) -> str:
+def run_once(
+    args: argparse.Namespace,
+    attempt: int,
+    web: Optional[NvrWebServer] = None,
+) -> str:
     """
     One connect/play/stream cycle. Returns one of:
       - "ok"      — the stream ran and the user asked to stop; no retry.
@@ -251,6 +273,28 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
     sinks: list[_SubprocessSink] = []
     rtp_capture: Optional[RtpCaptureWriter] = None
     verdict = "retry"  # pessimistic default; overwritten on clean exit
+
+    # Access-unit accumulator for the web viewer. Hoisted to the top of
+    # the function so the `finally` block can safely call _flush_au() even
+    # on an early-return error path (connect timeout, auth failure, …)
+    # where the main for-loop never ran.
+    au_buf: list[bytes] = []
+    au_is_key = False
+    au_ts: Optional[int] = None
+
+    def _flush_au() -> None:
+        nonlocal au_buf, au_is_key, au_ts
+        if web is not None and au_buf:
+            web.publish_video(b"".join(au_buf), au_is_key)
+        au_buf = []
+        au_is_key = False
+        au_ts = None
+
+    def _web_state(state: str, detail: str = "") -> None:
+        if web is not None:
+            web.publish_status({"state": state, "detail": detail, "attempt": attempt})
+
+    _web_state("connecting", f"RTSP attempt #{attempt}")
 
     try:
         log.info("[attempt %d] connecting to %s", attempt, args.url.rsplit("@", 1)[-1])
@@ -264,11 +308,13 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
             # attacker with ip_forward=0, iptables REDIRECT pointing at a port with
             # nothing listening, etc. Retriable.
             log.error("transport error on connect: %s", e)
+            _web_state("reconnecting", f"transport: {e}")
             return "retry"
         except RtspError as e:
             # 401 after we've already tried creds, SDP has no video track, …
             # Retrying won't help without user intervention.
             log.error("RTSP error on handshake: %s", e)
+            _web_state("error", f"handshake: {e}")
             return "fatal"
 
         log.info(
@@ -284,10 +330,25 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
             client.play()
         except OSError as e:
             log.error("transport error during SETUP/PLAY: %s", e)
+            _web_state("reconnecting", f"setup: {e}")
             return "retry"
         except RtspError as e:
             log.error("RTSP error during SETUP/PLAY: %s", e)
+            _web_state("error", f"setup: {e}")
             return "fatal"
+
+        # Publish the stream parameters to any connected browser. Each
+        # publish_config bumps the server's epoch so the player calls
+        # VideoDecoder.configure() again — necessary when the camera changes
+        # SPS/PPS (resolution/bitrate change) or when a reconnect lands on a
+        # fresh RTSP session with new parameter sets.
+        if web is not None:
+            web.publish_config(
+                codec="H264" if track.encoding == "H264" else "H265",
+                sps=list(track.sps),
+                pps=list(track.pps),
+                vps=list(track.vps),
+            )
 
         # After PLAY, apply the stall timeout so a dead stream can't block
         # recv() forever — recv raises TimeoutError and we reconnect.
@@ -327,6 +388,7 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
                 sink.write(prelude)
 
         stats = LiveStats()
+        last_web_status = 0.0
 
         try:
             for kind, channel, payload in iter_interleaved(client.sock, seed=client.consume_leftover()):
@@ -357,23 +419,43 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
                 if rtp_capture is not None:
                     rtp_capture.write(channel, payload)
 
+                # Timestamp change signals a new picture — flush any pending AU.
+                if au_ts is not None and parsed["ts"] != au_ts:
+                    _flush_au()
+
                 for nalu in depay.feed(parsed["payload"], parsed["seq"]):
                     stats.nalus += 1
                     if track.encoding == "H264":
                         nal_type = nalu[4] & 0x1F
                         if nal_type == 5:
                             stats.keyframes += 1
+                            au_is_key = True
                     else:
                         nal_type = (nalu[4] >> 1) & 0x3F
                         if nal_type in (19, 20, 21):
                             stats.keyframes += 1
+                            au_is_key = True
                     for sink in sinks:
                         sink.write(nalu)
+                    au_buf.append(nalu)
+
+                au_ts = parsed["ts"]
+
+                # RTP marker also closes the current access unit (end of frame),
+                # for cameras that keep the same timestamp across multiple pics.
+                if parsed["marker"]:
+                    _flush_au()
 
                 line = stats.tick()
                 if line is not None:
                     sys.stderr.write("\r" + line)
                     sys.stderr.flush()
+                    now = time.monotonic()
+                    if web is not None and now - last_web_status >= 0.5:
+                        snap = stats.snapshot()
+                        if snap is not None:
+                            web.publish_status(snap)
+                        last_web_status = now
             else:
                 # Generator exhausted without the user asking to stop → peer
                 # closed the TCP connection. Retriable.
@@ -387,6 +469,9 @@ def run_once(args: argparse.Namespace, attempt: int) -> str:
             log.error("stream ended: %s", e)
 
     finally:
+        # Flush any residual access unit so the viewer isn't missing the
+        # last partial frame when a session ends cleanly.
+        _flush_au()
         sys.stderr.write("\n")
         log.info("tearing down session")
         try:
@@ -420,16 +505,33 @@ def run(args: argparse.Namespace) -> int:
 
     signal.signal(signal.SIGTERM, _on_sigterm)
 
+    # The web server (if asked for) lives for the whole process, not per
+    # attempt — that's the whole point: the browser stays connected across
+    # RTSP reconnects.
+    web: Optional[NvrWebServer] = None
+    if args.serve:
+        host, port = _parse_serve(args.serve)
+        try:
+            web = NvrWebServer(host=host, port=port)
+            web.start()
+        except RuntimeError as e:
+            log.error("web viewer disabled: %s", e)
+            web = None
+
     attempt = 0
     try:
         while not _user_stop.is_set():
             attempt += 1
-            verdict = run_once(args, attempt)
+            verdict = run_once(args, attempt, web=web)
 
             if verdict == "ok" or _user_stop.is_set():
+                if web is not None:
+                    web.publish_status({"state": "stopped", "detail": "NVR exited"})
                 return 0
             if verdict == "fatal":
                 log.error("unrecoverable error — not reconnecting")
+                if web is not None:
+                    web.publish_status({"state": "error", "detail": "unrecoverable"})
                 return 2
             if args.no_reconnect:
                 log.error("--no-reconnect set — exiting after first failure")
@@ -440,13 +542,34 @@ def run(args: argparse.Namespace) -> int:
 
             delay = args.reconnect_delay
             log.info("reconnecting in %.1fs (next attempt: #%d)", delay, attempt + 1)
+            if web is not None:
+                web.publish_status({
+                    "state": "reconnecting",
+                    "detail": f"next attempt in {delay:.1f}s",
+                    "attempt": attempt,
+                })
             if _user_stop.wait(delay):
                 return 0
     except KeyboardInterrupt:
         log.info("Ctrl-C — shutting down")
         return 0
+    finally:
+        if web is not None:
+            web.stop()
 
     return 0
+
+
+def _parse_serve(spec: str) -> tuple[str, int]:
+    """Parse --serve values like '8080', ':8080', '127.0.0.1:8080', '0.0.0.0:8080'."""
+    s = spec.strip()
+    if s.startswith(":"):
+        return "127.0.0.1", int(s[1:])
+    if ":" in s:
+        host, port = s.rsplit(":", 1)
+        return host or "127.0.0.1", int(port)
+    # Bare port
+    return "127.0.0.1", int(s)
 
 
 def parse_args() -> argparse.Namespace:
@@ -455,9 +578,11 @@ def parse_args() -> argparse.Namespace:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  # Live view only, through the MITM proxy on localhost:5540\n"
-            "  python nvr.py --url rtsp://admin:admin@127.0.0.1:5540/stream\n\n"
-            "  # Live view + continuous MP4 recording\n"
+            "  # Browser viewer at http://127.0.0.1:8080 — stays open across\n"
+            "  # RTSP reconnects, decodes with WebCodecs, has live stats panel.\n"
+            "  python nvr.py --url rtsp://admin:admin@192.168.1.108:554/stream \\\n"
+            "                --no-display --serve 8080\n\n"
+            "  # Classic ffplay window + continuous MP4 recording\n"
             "  python nvr.py --url rtsp://admin:admin@192.168.1.108:554/stream \\\n"
             "                --record-mp4 session.mp4\n\n"
             "  # Headless capture of a .rtp replay file for `rtspoofing --mode inject`\n"
@@ -467,8 +592,11 @@ def parse_args() -> argparse.Namespace:
     )
     ap.add_argument("--url", required=True,
                     help="rtsp://[user[:pass]@]host[:port]/path")
+    ap.add_argument("--serve", default=None,
+                    help="run a localhost web viewer on this port (e.g. 8080, ':8080', or 'host:port'). "
+                         "The browser connection survives RTSP reconnects.")
     ap.add_argument("--no-display", action="store_true",
-                    help="skip ffplay; useful for headless capture")
+                    help="skip ffplay; useful for headless capture or when --serve is the viewer")
     ap.add_argument("--record-mp4", default=None,
                     help="write an MP4 of the stream (uses ffmpeg -c copy)")
     ap.add_argument("--record-rtp", default=None,

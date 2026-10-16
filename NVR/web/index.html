@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTSPoofing NVR</title>
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --panel: rgba(10, 12, 16, 0.78);
+    --fg: #e6e6e6;
+    --muted: #8a8f98;
+    --accent: #4ad17a;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+    --dim: #2a2d35;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    overflow: hidden;
+  }
+  #stage {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  canvas {
+    max-width: 100%;
+    max-height: 100%;
+    object-fit: contain;
+    image-rendering: optimizeQuality;
+    background: #000;
+    display: block;
+  }
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    background: linear-gradient(180deg, rgba(0,0,0,0.3), rgba(0,0,0,0.65));
+    color: var(--fg);
+    pointer-events: none;
+    transition: opacity 180ms ease-out;
+    gap: 12px;
+    font-size: 18px;
+    text-align: center;
+    padding: 20px;
+  }
+  #overlay.hidden { opacity: 0; }
+  #overlay .spinner {
+    width: 32px; height: 32px;
+    border: 3px solid var(--dim);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 900ms linear infinite;
+  }
+  #overlay.warn .spinner { border-top-color: var(--warn); }
+  #overlay.err .spinner { border-top-color: var(--err); animation: none; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  #overlay .sub { color: var(--muted); font-size: 13px; }
+
+  #stats {
+    position: absolute;
+    left: 12px; right: 12px; bottom: 12px;
+    background: var(--panel);
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 10px;
+    padding: 10px 14px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 6px 18px;
+    pointer-events: none;
+  }
+  .kv { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .kv .k { color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; font-size: 10px; }
+  .kv .v { color: var(--fg); font-variant-numeric: tabular-nums; }
+  .kv .v.good { color: var(--accent); }
+  .kv .v.warn { color: var(--warn); }
+  .kv .v.err  { color: var(--err); }
+
+  #title {
+    position: absolute;
+    left: 12px; top: 12px;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    text-transform: uppercase;
+    background: var(--panel);
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid rgba(255,255,255,0.06);
+    pointer-events: none;
+  }
+  #title .dot {
+    display: inline-block;
+    width: 7px; height: 7px;
+    border-radius: 50%;
+    margin-right: 7px;
+    vertical-align: 1px;
+    background: var(--muted);
+    transition: background 180ms;
+  }
+  #title.live .dot { background: var(--accent); box-shadow: 0 0 8px var(--accent); }
+  #title.warn .dot { background: var(--warn); }
+  #title.err  .dot { background: var(--err); }
+</style>
+</head>
+<body>
+<div id="title"><span class="dot"></span><span id="title-text">starting</span></div>
+<div id="stage"><canvas id="canvas" width="640" height="360"></canvas></div>
+<div id="overlay">
+  <div class="spinner"></div>
+  <div id="overlay-text">connecting to NVR…</div>
+  <div class="sub" id="overlay-sub"></div>
+</div>
+<div id="stats">
+  <div class="kv"><span class="k">state</span>  <span class="v" id="k-state">—</span></div>
+  <div class="kv"><span class="k">codec</span>  <span class="v" id="k-codec">—</span></div>
+  <div class="kv"><span class="k">ssrc</span>   <span class="v" id="k-ssrc">—</span></div>
+  <div class="kv"><span class="k">rtp pkts</span><span class="v" id="k-rtp">0</span></div>
+  <div class="kv"><span class="k">frames</span> <span class="v" id="k-frames">0</span></div>
+  <div class="kv"><span class="k">kbps</span>   <span class="v" id="k-kbps">0</span></div>
+  <div class="kv"><span class="k">fps</span>    <span class="v" id="k-fps">0</span></div>
+  <div class="kv"><span class="k">keyframes</span><span class="v" id="k-kf">0</span></div>
+  <div class="kv"><span class="k">drift</span>  <span class="v" id="k-drift">—</span></div>
+  <div class="kv"><span class="k">decoder</span><span class="v" id="k-decoder">—</span></div>
+</div>
+
+<script>
+"use strict";
+
+const MSG_CONFIG = 0;
+const MSG_VIDEO  = 1;
+const MSG_STATUS = 2;
+
+const els = {
+  canvas:   document.getElementById("canvas"),
+  overlay:  document.getElementById("overlay"),
+  oText:    document.getElementById("overlay-text"),
+  oSub:     document.getElementById("overlay-sub"),
+  title:    document.getElementById("title"),
+  titleTxt: document.getElementById("title-text"),
+  k: {
+    state:   document.getElementById("k-state"),
+    codec:   document.getElementById("k-codec"),
+    ssrc:    document.getElementById("k-ssrc"),
+    rtp:     document.getElementById("k-rtp"),
+    frames:  document.getElementById("k-frames"),
+    kbps:    document.getElementById("k-kbps"),
+    fps:     document.getElementById("k-fps"),
+    kf:      document.getElementById("k-kf"),
+    drift:   document.getElementById("k-drift"),
+    decoder: document.getElementById("k-decoder"),
+  },
+};
+
+const ctx = els.canvas.getContext("2d", { alpha: false, desynchronized: true });
+
+// --- UI helpers -----------------------------------------------------------
+
+function setBadge(mode, text) {
+  // mode: "" | "live" | "warn" | "err"
+  els.title.className = mode;
+  els.titleTxt.textContent = text;
+}
+
+function setOverlay(mode, text, sub) {
+  // mode: null (hide) | "" (loading) | "warn" | "err"
+  if (mode === null) {
+    els.overlay.classList.add("hidden");
+    return;
+  }
+  els.overlay.className = mode;
+  els.overlay.classList.remove("hidden");
+  els.oText.textContent = text || "";
+  els.oSub.textContent = sub || "";
+}
+
+function b64decode(s) {
+  const bin = atob(s);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+function concat(a, b) {
+  const out = new Uint8Array(a.length + b.length);
+  out.set(a, 0);
+  out.set(b, a.length);
+  return out;
+}
+
+// --- Local frame-rate / render-side stats ---------------------------------
+
+const local = {
+  renderedFrames: 0,
+  renderedWindow: [],  // timestamps of last 2s of rendered frames
+  pushFrame() {
+    this.renderedFrames++;
+    const now = performance.now();
+    this.renderedWindow.push(now);
+    const cutoff = now - 2000;
+    while (this.renderedWindow.length && this.renderedWindow[0] < cutoff) {
+      this.renderedWindow.shift();
+    }
+  },
+  renderedFps() {
+    if (this.renderedWindow.length < 2) return 0;
+    const span = (this.renderedWindow[this.renderedWindow.length - 1] - this.renderedWindow[0]) / 1000;
+    return span > 0 ? (this.renderedWindow.length - 1) / span : 0;
+  },
+};
+
+// --- WebCodecs player ------------------------------------------------------
+
+class Player {
+  constructor() {
+    this.decoder = null;
+    this.currentEpoch = -1;
+    this.currentCodec = null;
+    this.waitingForKey = true;
+    this.chunkTs = 0;  // monotonically increasing synthetic timestamp
+  }
+
+  buildCodecString(info) {
+    if (info.codec === "H264") {
+      // avc1.<profile_idc><constraint><level_idc>, 6 hex chars.
+      if (!info.sps || info.sps.length === 0) return "avc1.42E01E";
+      const sps = b64decode(info.sps[0]);
+      if (sps.length < 4) return "avc1.42E01E";
+      const h = (n) => n.toString(16).padStart(2, "0").toUpperCase();
+      return "avc1." + h(sps[1]) + h(sps[2]) + h(sps[3]);
+    }
+    if (info.codec === "H265" || info.codec === "HEVC") {
+      // Fallback generic HEVC Main profile @ L4.0. Browsers that support
+      // HEVC in WebCodecs tend to accept this; stricter codec strings
+      // would require parsing the VPS/SPS.
+      return "hvc1.1.6.L120.90";
+    }
+    return "avc1.42E01E";
+  }
+
+  async configure(info) {
+    const codec = this.buildCodecString(info);
+
+    // Probe support before touching the live decoder.
+    try {
+      const probe = await VideoDecoder.isConfigSupported({ codec });
+      if (!probe.supported) {
+        setOverlay("err", "codec not supported by this browser",
+                   codec + " — try Chrome/Edge, or Safari 16.4+");
+        els.k.decoder.textContent = "unsupported";
+        els.k.decoder.className = "v err";
+        return;
+      }
+    } catch (e) {
+      // isConfigSupported itself may throw on older browsers; try to configure anyway.
+    }
+
+    if (this.decoder) {
+      try { this.decoder.close(); } catch (e) {}
+      this.decoder = null;
+    }
+
+    this.decoder = new VideoDecoder({
+      output: (frame) => {
+        // Match canvas to native frame size on first/changed frame.
+        if (frame.displayWidth !== els.canvas.width ||
+            frame.displayHeight !== els.canvas.height) {
+          els.canvas.width = frame.displayWidth;
+          els.canvas.height = frame.displayHeight;
+        }
+        try {
+          ctx.drawImage(frame, 0, 0, els.canvas.width, els.canvas.height);
+          local.pushFrame();
+        } catch (e) {
+          console.error("drawImage", e);
+        } finally {
+          frame.close();
+        }
+      },
+      error: (e) => {
+        console.error("VideoDecoder error", e);
+        // Non-fatal: mark decoder bad, wait for the next CONFIG epoch or keyframe.
+        els.k.decoder.textContent = "error";
+        els.k.decoder.className = "v err";
+        this.waitingForKey = true;
+      },
+    });
+
+    this.decoder.configure({
+      codec,
+      optimizeForLatency: true,
+      hardwareAcceleration: "prefer-hardware",
+      // No `description` → the decoder reads Annex-B start codes directly.
+    });
+
+    this.currentEpoch = info.epoch;
+    this.currentCodec = codec;
+    this.waitingForKey = true;
+
+    els.k.codec.textContent = codec;
+    els.k.decoder.textContent = "ready";
+    els.k.decoder.className = "v good";
+  }
+
+  decodeAccessUnit(data, isKeyframe) {
+    if (!this.decoder) return;
+    if (this.decoder.state !== "configured") return;
+    if (this.waitingForKey && !isKeyframe) return;
+    this.waitingForKey = false;
+
+    try {
+      const chunk = new EncodedVideoChunk({
+        type: isKeyframe ? "key" : "delta",
+        timestamp: this.chunkTs,
+        data,
+      });
+      // 33 ms synthetic step — WebCodecs doesn't act on this value for
+      // display, it just has to be monotonically increasing.
+      this.chunkTs += 33333;
+      this.decoder.decode(chunk);
+    } catch (e) {
+      console.error("decode failed", e);
+      this.waitingForKey = true;
+    }
+  }
+
+  close() {
+    if (this.decoder) {
+      try { this.decoder.close(); } catch (e) {}
+      this.decoder = null;
+    }
+  }
+}
+
+// --- /stream reader --------------------------------------------------------
+
+async function runOnce(player) {
+  setOverlay("", "connecting to NVR…", "");
+  setBadge("", "connecting");
+  const resp = await fetch("/stream");
+  if (!resp.ok) throw new Error("HTTP " + resp.status);
+  if (!resp.body) throw new Error("stream has no body");
+  const reader = resp.body.getReader();
+
+  setOverlay("", "awaiting keyframe…", "");
+  setBadge("warn", "awaiting keyframe");
+
+  let buf = new Uint8Array(0);
+  let gotFirstFrame = false;
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) throw new Error("stream closed by server");
+    buf = concat(buf, value);
+
+    // Parse as many complete framed messages as the buffer holds.
+    while (buf.length >= 5) {
+      const dv = new DataView(buf.buffer, buf.byteOffset);
+      const len = dv.getUint32(0, false);  // length includes the type byte
+      if (buf.length < 4 + len) break;
+      const type = buf[4];
+      const payload = buf.subarray(5, 4 + len);
+
+      if (type === MSG_CONFIG) {
+        const info = JSON.parse(new TextDecoder().decode(payload));
+        await player.configure(info);
+      } else if (type === MSG_VIDEO) {
+        if (payload.length >= 2) {
+          const isKey = payload[0] === 1;
+          const au = payload.subarray(1);
+          player.decodeAccessUnit(au, isKey);
+          if (!gotFirstFrame && isKey) {
+            gotFirstFrame = true;
+            setOverlay(null);
+            setBadge("live", "live");
+          }
+        }
+      } else if (type === MSG_STATUS) {
+        try {
+          handleStatus(JSON.parse(new TextDecoder().decode(payload)));
+        } catch (e) { /* ignore */ }
+      }
+      // Advance past the consumed message (copy, since subarray aliases).
+      buf = buf.slice(4 + len);
+    }
+  }
+}
+
+function handleStatus(s) {
+  if (s.state) {
+    els.k.state.textContent = s.state;
+    if (s.state === "streaming")      els.k.state.className = "v good";
+    else if (s.state === "connecting"
+          || s.state === "reconnecting") {
+      els.k.state.className = "v warn";
+      setBadge("warn", s.state);
+      setOverlay("warn", s.state + "…",
+                 s.detail || "the NVR is reaching the camera again");
+    } else if (s.state === "error")   els.k.state.className = "v err";
+    else                              els.k.state.className = "v";
+  }
+  if (s.ssrc !== undefined)       els.k.ssrc.textContent = s.ssrc;
+  if (s.rtp_packets !== undefined) els.k.rtp.textContent = s.rtp_packets.toLocaleString();
+  if (s.nalus !== undefined)      els.k.frames.textContent = s.nalus.toLocaleString();
+  if (s.kbps !== undefined)       els.k.kbps.textContent = Math.round(s.kbps).toLocaleString();
+  if (s.fps !== undefined)        els.k.fps.textContent = s.fps.toFixed(1);
+  if (s.keyframes !== undefined)  els.k.kf.textContent = s.keyframes.toLocaleString();
+  if (s.drift !== undefined) {
+    const d = s.drift;
+    els.k.drift.textContent = (d >= 0 ? "+" : "") + d.toFixed(2) + "s";
+    els.k.drift.className = Math.abs(d) > 2 ? "v warn" : "v";
+  }
+}
+
+// --- outer reconnect loop --------------------------------------------------
+
+async function main() {
+  if (typeof VideoDecoder === "undefined") {
+    setOverlay("err", "this browser has no WebCodecs API",
+               "use Chrome 94+, Edge 94+, Safari 16.4+, or Firefox 130+");
+    setBadge("err", "unsupported");
+    return;
+  }
+
+  const player = new Player();
+
+  // Local-render FPS tick (independent of server status cadence).
+  setInterval(() => {
+    const rf = local.renderedFps();
+    if (rf > 0) {
+      els.k.fps.textContent = rf.toFixed(1);
+    }
+  }, 500);
+
+  let delay = 500;
+  while (true) {
+    try {
+      await runOnce(player);
+    } catch (e) {
+      console.warn("stream dropped:", e && e.message);
+      setBadge("err", "nvr unreachable");
+      setOverlay("err", "NVR unreachable",
+                 "retrying in " + (delay / 1000).toFixed(1) + "s — is the NVR process running?");
+    }
+    await new Promise((r) => setTimeout(r, delay));
+    // Exponential backoff capped at 5s so we don't hammer the server.
+    delay = Math.min(delay * 2, 5000);
+  }
+}
+
+main();
+</script>
+</body>
+</html>

@@ -42,9 +42,11 @@ RTSPoofing/
 │   └── target/release/    # Compiled binary
 │
 ├── NVR/                   # Minimal RTSP viewer/recorder for the PoC lab
-│   ├── nvr.py             # Orchestrator (display + MP4 + .rtp sinks, live stats)
+│   ├── nvr.py             # Orchestrator (ffplay + MP4 + .rtp + web sinks, live stats)
 │   ├── rtsp_client.py     # RTSP/1.0-over-TCP client with Basic + Digest auth
 │   ├── rtp_depay.py       # H.264/H.265 RTP depacketizer to Annex-B
+│   ├── web_server.py      # Localhost HTTP streaming server (chunked framed binary)
+│   ├── web/index.html     # Browser viewer with WebCodecs decoding + live stats
 │   └── README.md          # Usage
 │
 ├── captured.rtp           # Example capture file
