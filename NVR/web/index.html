@@ -125,27 +125,8 @@
     position: absolute;
     background: #000;
     pointer-events: none;
-    display: none;
     z-index: 2;
-    transition: opacity 180ms ease-out;
   }
-  .osd-mask.show { display: block; }
-  #mask-toggle {
-    position: absolute;
-    right: 70px; top: 12px;
-    font-size: 11px;
-    color: var(--muted);
-    text-transform: uppercase;
-    background: var(--panel);
-    padding: 6px 10px;
-    border-radius: 6px;
-    border: 1px solid rgba(255,255,255,0.06);
-    cursor: pointer;
-    user-select: none;
-    z-index: 10;
-  }
-  #mask-toggle:hover { color: var(--fg); }
-  #mask-toggle.on { color: var(--accent); border-color: rgba(74,209,122,0.3); }
 
   #stats {
     position: absolute;
@@ -240,13 +221,11 @@
 </head>
 <body>
 <div id="title"><span class="dot"></span><span id="title-text">starting</span></div>
-<div id="mask-toggle" title="toggle OSD mask (hides camera date/time)">mask</div>
 <div id="debug-toggle" title="toggle diagnostic log">diag</div>
 <div id="debug"></div>
 <div id="stage">
   <canvas id="canvas" width="640" height="360"></canvas>
   <div id="mask-top" class="osd-mask"></div>
-  <div id="mask-bottom" class="osd-mask"></div>
 </div>
 <div id="ribbon">
   <span class="pulse"></span>
@@ -315,76 +294,31 @@ const debugToggle = document.getElementById("debug-toggle");
 
 // --- OSD mask (hide camera date/time) ------------------------------------
 // Dahua/IMOU cameras overlay a timestamp inside the picture itself —
-// there is no way to switch it off from the RTSP side. The mask covers
-// the top (default) and/or bottom strip, tracking the canvas's rendered
-// rect so letterboxing on wide/tall windows doesn't leak the OSD into a
-// black bar region.
+// there is no way to switch it off from the RTSP side, so the viewer
+// permanently blacks out the top strip of the picture. Positioned by JS
+// so letterboxing on wide/tall windows doesn't leak the OSD into a
+// black-bar region. Height is a fraction of the canvas's rendered height,
+// overridable with ?mask-frac=0..0.5 for cameras whose OSD font is bigger.
 
 const maskTop = document.getElementById("mask-top");
-const maskBottom = document.getElementById("mask-bottom");
-const maskToggle = document.getElementById("mask-toggle");
 const stageEl = document.getElementById("stage");
 
-// Read persisted settings. "where" is a comma-separated subset of
-// {top,bottom}. "frac" is 0..0.5. Defaults mask the top strip only.
-function readMaskSettings() {
-  let where = "top";
-  let frac = 0.085;
-  try {
-    const s = JSON.parse(localStorage.getItem("nvr-mask") || "null");
-    if (s && typeof s === "object") {
-      if (typeof s.where === "string") where = s.where;
-      if (typeof s.frac === "number" && s.frac > 0 && s.frac < 0.5) frac = s.frac;
-    }
-  } catch (e) { /* ignore */ }
-  // URL overrides: ?mask=off | ?mask=top | ?mask=bottom | ?mask=top,bottom
-  const urlMask = new URL(location.href).searchParams.get("mask");
-  if (urlMask !== null) where = urlMask;
-  const urlFrac = parseFloat(new URL(location.href).searchParams.get("mask-frac") || "");
-  if (urlFrac > 0 && urlFrac < 0.5) frac = urlFrac;
-  return { where, frac };
-}
-let mask = readMaskSettings();
+const MASK_FRAC_DEFAULT = 0.14;
+let maskFrac = MASK_FRAC_DEFAULT;
+const urlFrac = parseFloat(new URL(location.href).searchParams.get("mask-frac") || "");
+if (urlFrac > 0 && urlFrac < 0.5) maskFrac = urlFrac;
 
 function layoutMasks() {
   const cRect = els.canvas.getBoundingClientRect();
   const sRect = stageEl.getBoundingClientRect();
-  const left = cRect.left - sRect.left;
-  const top = cRect.top - sRect.top;
-  const h = Math.round(cRect.height * mask.frac);
-  for (const [el, side] of [[maskTop, "top"], [maskBottom, "bottom"]]) {
-    const on = mask.where !== "off" && mask.where.indexOf(side) >= 0;
-    if (!on) { el.classList.remove("show"); continue; }
-    el.classList.add("show");
-    el.style.left = left + "px";
-    el.style.width = cRect.width + "px";
-    el.style.height = h + "px";
-    if (side === "top") {
-      el.style.top = top + "px";
-      el.style.bottom = "auto";
-    } else {
-      el.style.top = (top + cRect.height - h) + "px";
-      el.style.bottom = "auto";
-    }
-  }
-  maskToggle.classList.toggle("on", mask.where !== "off");
-  maskToggle.textContent = mask.where === "off" ? "mask" : "mask · " + mask.where;
+  maskTop.style.left   = (cRect.left - sRect.left) + "px";
+  maskTop.style.top    = (cRect.top  - sRect.top)  + "px";
+  maskTop.style.width  = cRect.width + "px";
+  maskTop.style.height = Math.round(cRect.height * maskFrac) + "px";
 }
-
-// Keep the mask glued to the canvas on window resize AND on canvas
-// intrinsic-size change (new frame resolution).
 new ResizeObserver(layoutMasks).observe(els.canvas);
 window.addEventListener("resize", layoutMasks);
-// Initial layout — before any frame, canvas has its placeholder 640x360.
 layoutMasks();
-
-maskToggle.addEventListener("click", () => {
-  // Cycle: top → top,bottom → bottom → off → top
-  const next = { top: "top,bottom", "top,bottom": "bottom", bottom: "off", off: "top" };
-  mask.where = next[mask.where] || "top";
-  try { localStorage.setItem("nvr-mask", JSON.stringify(mask)); } catch (e) {}
-  layoutMasks();
-});
 
 // Open on load for first-run diagnostics; the user can click "diag" to hide.
 let debugOpen = true;
