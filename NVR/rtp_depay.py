@@ -103,6 +103,14 @@ class RtpDepayH264:
         p, self._prelude = self._prelude, b""
         return p
 
+    def reset_fragments(self) -> None:
+        """
+        Drop any in-progress FU-A reassembly. Called at session boundaries
+        (SSRC change, injection switch) so a half-received fragment from the
+        previous session isn't completed with a packet from the new one.
+        """
+        self._fu.reset()
+
     def feed(self, payload: bytes, seq: int) -> Iterator[bytes]:
         if not payload:
             return
@@ -176,6 +184,10 @@ class RtpDepayH265:
     def take_prelude(self) -> bytes:
         p, self._prelude = self._prelude, b""
         return p
+
+    def reset_fragments(self) -> None:
+        """Drop any in-progress FU reassembly (see RtpDepayH264.reset_fragments)."""
+        self._fu.reset()
 
     def feed(self, payload: bytes, seq: int) -> Iterator[bytes]:
         if len(payload) < 2:

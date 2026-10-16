@@ -390,6 +390,34 @@ def run_once(
         stats = LiveStats()
         last_web_status = 0.0
 
+        def _session_boundary(reason: str, new_ssrc: int, new_ts: int) -> None:
+            """
+            Treat an SSRC flip as a soft reset: the proxy has just switched
+            between live and injected streams, so RTP seq/ts jump
+            discontinuously and any FU-A fragment in flight belongs to the
+            old session. Flush pending state and tell the browser to re-wait
+            for a keyframe (new epoch) so the decoder flushes cleanly
+            instead of trying to patch the new frames onto the old ones.
+            """
+            log.info("session boundary: %s → ssrc=%08x", reason, new_ssrc)
+            _flush_au()
+            depay.reset_fragments()
+            stats.ssrc = new_ssrc
+            stats.first_rtp_ts = new_ts
+            stats.first_wallclock = time.time()
+            if web is not None:
+                web.publish_config(
+                    codec="H264" if track.encoding == "H264" else "H265",
+                    sps=list(track.sps),
+                    pps=list(track.pps),
+                    vps=list(track.vps),
+                )
+                web.publish_status({
+                    "state": "reconnecting",
+                    "detail": f"source switched ({reason})",
+                    "attempt": attempt,
+                })
+
         try:
             for kind, channel, payload in iter_interleaved(client.sock, seed=client.consume_leftover()):
                 if _user_stop.is_set():
@@ -414,6 +442,11 @@ def run_once(
                     stats.first_wallclock = time.time()
                     stats.first_rtp_ts = parsed["ts"]
                     stats.ssrc = parsed["ssrc"]
+                elif parsed["ssrc"] != stats.ssrc:
+                    # Injection flipped the stream source. Reset cleanly
+                    # before touching the depay / AU state.
+                    _session_boundary("SSRC change", parsed["ssrc"], parsed["ts"])
+                    au_ts = None  # don't flush against the old timestamp
                 stats.last_rtp_ts = parsed["ts"]
 
                 if rtp_capture is not None:
