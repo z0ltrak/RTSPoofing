@@ -41,6 +41,12 @@ RTSPoofing/
 │   ├── Cargo.toml         # Rust dependencies
 │   └── target/release/    # Compiled binary
 │
+├── NVR/                   # Minimal RTSP viewer/recorder for the PoC lab
+│   ├── nvr.py             # Orchestrator (display + MP4 + .rtp sinks, live stats)
+│   ├── rtsp_client.py     # RTSP/1.0-over-TCP client with Basic + Digest auth
+│   ├── rtp_depay.py       # H.264/H.265 RTP depacketizer to Annex-B
+│   └── README.md          # Usage
+│
 ├── captured.rtp           # Example capture file
 ├── LICENSE
 └── README.md              # This file
@@ -227,6 +233,18 @@ while true; do
     sleep 2
 done
 ```
+
+Or, for a demo that also records the viewer-side stream and surfaces the
+on-wire state (SSRC, RTP media-clock vs. wall-clock drift, keyframe cadence),
+use the bundled NVR:
+
+```bash
+python NVR/nvr.py --url rtsp://user:pass@<CAMERA_IP>:554/stream \
+                  --record-mp4 session.mp4
+```
+
+See `NVR/README.md` for the rest of its options, including `--record-rtp`
+to produce a loopable capture directly consumable by `--mode inject`.
 
 ## How It Works
 
