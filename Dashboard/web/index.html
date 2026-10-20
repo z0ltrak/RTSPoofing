@@ -1,0 +1,649 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RTSPoofing Control</title>
+<style>
+  :root {
+    --bg: #0a0a0b;
+    --panel: #121318;
+    --panel-2: #1a1b22;
+    --fg: #e6e6e6;
+    --muted: #8a8f98;
+    --accent: #4ad17a;
+    --warn: #ffb454;
+    --err: #ff6b6b;
+    --dim: #2a2d35;
+    --input-bg: #0d0e13;
+    --input-border: #2a2d35;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    min-height: 100%;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    font-size: 14px;
+    line-height: 1.4;
+  }
+  .wrap {
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 24px 20px 40px;
+  }
+
+  /* ---- header ---- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 16px;
+    margin-bottom: 20px;
+    flex-wrap: wrap;
+  }
+  header h1 {
+    font-size: 18px;
+    margin: 0;
+    letter-spacing: 0.02em;
+  }
+  header h1 .brand { color: var(--accent); }
+  .status-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 10px;
+    background: var(--panel);
+    border: 1px solid var(--dim);
+    padding: 8px 14px 8px 10px;
+    border-radius: 999px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+  }
+  .status-chip .dot {
+    width: 9px; height: 9px;
+    border-radius: 50%;
+    background: var(--muted);
+    box-shadow: 0 0 0 0 rgba(0,0,0,0);
+  }
+  .status-chip.running .dot {
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+    animation: throb 1600ms ease-in-out infinite;
+  }
+  .status-chip.error .dot { background: var(--err); }
+  @keyframes throb { 50% { opacity: 0.55; } }
+  .status-chip .label { color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; font-size: 10px; }
+  .status-chip .val { color: var(--fg); }
+
+  /* ---- grid ---- */
+  .grid {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.1fr);
+    gap: 20px;
+  }
+  @media (max-width: 920px) { .grid { grid-template-columns: 1fr; } }
+
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--dim);
+    border-radius: 12px;
+    padding: 18px 20px;
+  }
+  .card + .card { margin-top: 20px; }
+  .card h2 {
+    font-size: 13px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+    margin: 0 0 14px;
+    font-weight: 600;
+  }
+
+  /* ---- form controls ---- */
+  .row {
+    display: grid;
+    grid-template-columns: 110px 1fr;
+    gap: 10px 14px;
+    align-items: center;
+    margin: 8px 0;
+  }
+  .row label { color: var(--muted); font-size: 12px; }
+  .row input[type=text],
+  .row input[type=number] {
+    background: var(--input-bg);
+    color: var(--fg);
+    border: 1px solid var(--input-border);
+    border-radius: 6px;
+    padding: 7px 10px;
+    font: inherit;
+    width: 100%;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 13px;
+  }
+  .row input:focus { outline: none; border-color: var(--accent); }
+  .row-group {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+  }
+
+  /* segmented mode selector */
+  .seg {
+    display: inline-flex;
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 8px;
+    padding: 3px;
+    gap: 3px;
+  }
+  .seg button {
+    background: transparent;
+    color: var(--muted);
+    border: 0;
+    padding: 6px 14px;
+    border-radius: 6px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    transition: background 120ms, color 120ms;
+  }
+  .seg button:hover { color: var(--fg); }
+  .seg button.on { background: var(--accent); color: #0a0a0b; font-weight: 600; }
+
+  /* checkbox pill */
+  .toggle {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    user-select: none;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .toggle input {
+    appearance: none;
+    width: 32px; height: 18px;
+    background: var(--dim);
+    border-radius: 999px;
+    position: relative;
+    cursor: pointer;
+    transition: background 150ms;
+  }
+  .toggle input::after {
+    content: "";
+    position: absolute;
+    top: 2px; left: 2px;
+    width: 14px; height: 14px;
+    background: var(--muted);
+    border-radius: 50%;
+    transition: left 150ms, background 150ms;
+  }
+  .toggle input:checked { background: rgba(74,209,122,0.3); }
+  .toggle input:checked::after { left: 16px; background: var(--accent); }
+  .toggle.on span { color: var(--fg); }
+
+  /* collapsible */
+  details { margin-top: 14px; }
+  details summary {
+    cursor: pointer;
+    color: var(--muted);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 8px 0;
+    user-select: none;
+  }
+  details summary:hover { color: var(--fg); }
+  details > div { padding: 6px 0 2px; }
+
+  /* buttons */
+  .controls {
+    display: flex;
+    gap: 10px;
+    margin-top: 18px;
+    flex-wrap: wrap;
+  }
+  button.btn {
+    background: var(--panel-2);
+    color: var(--fg);
+    border: 1px solid var(--dim);
+    padding: 10px 18px;
+    border-radius: 8px;
+    cursor: pointer;
+    font: inherit;
+    font-size: 13px;
+    letter-spacing: 0.02em;
+    transition: border-color 120ms, background 120ms, color 120ms;
+  }
+  button.btn:hover { border-color: var(--accent); color: var(--accent); }
+  button.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.btn:disabled:hover { border-color: var(--dim); color: var(--fg); }
+  button.btn.primary { background: var(--accent); color: #0a0a0b; border-color: var(--accent); font-weight: 600; }
+  button.btn.primary:hover { background: #67dc93; border-color: #67dc93; color: #0a0a0b; }
+  button.btn.danger  { color: var(--err); border-color: rgba(255,107,107,0.3); }
+  button.btn.danger:hover  { background: rgba(255,107,107,0.1); border-color: var(--err); }
+
+  /* ---- logs ---- */
+  .log-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 10px;
+    gap: 10px;
+  }
+  .log-controls {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .log-controls input[type=text] {
+    background: var(--input-bg);
+    color: var(--fg);
+    border: 1px solid var(--input-border);
+    border-radius: 6px;
+    padding: 4px 8px;
+    font: inherit;
+    font-size: 12px;
+    width: 140px;
+  }
+  #log {
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.55;
+    height: 480px;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+  #log .line { padding: 1px 0; }
+  #log .line .t { color: #4a4e58; margin-right: 8px; }
+  #log .line.err  .m { color: #ffd9d9; }
+  #log .line.out  .m { color: var(--fg); }
+  #log .line.dash .m { color: var(--accent); }
+  #log .line.dash .t { color: var(--muted); }
+
+  /* ---- toasts ---- */
+  #toast {
+    position: fixed;
+    top: 20px; right: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    z-index: 100;
+    pointer-events: none;
+  }
+  #toast .t {
+    background: var(--panel);
+    border: 1px solid var(--dim);
+    padding: 10px 16px;
+    border-radius: 8px;
+    font-size: 13px;
+    animation: toastIn 180ms ease-out;
+    max-width: 420px;
+    pointer-events: auto;
+  }
+  #toast .t.err { border-color: rgba(255,107,107,0.5); color: var(--err); }
+  #toast .t.ok  { border-color: rgba(74,209,122,0.4);  color: var(--accent); }
+  @keyframes toastIn { from { opacity: 0; transform: translateY(-6px); } }
+
+  .cmdline {
+    background: var(--input-bg);
+    border: 1px solid var(--input-border);
+    border-radius: 6px;
+    padding: 8px 10px;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: pre-wrap;
+    word-break: break-all;
+    margin-top: 10px;
+    min-height: 32px;
+  }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <h1><span class="brand">RTSPoofing</span> · proxy control</h1>
+    <div class="status-chip" id="status-chip">
+      <span class="dot"></span>
+      <span><span class="label">state</span> <span class="val" id="state-val">—</span></span>
+      <span><span class="label">pid</span> <span class="val" id="pid-val">—</span></span>
+      <span><span class="label">up</span> <span class="val" id="up-val">—</span></span>
+    </div>
+  </header>
+
+  <div class="grid">
+
+    <!-- ========== LEFT: controls ========== -->
+    <div>
+    <div class="card">
+      <h2>Mode &amp; target</h2>
+
+      <div class="row">
+        <label>mode</label>
+        <div class="seg" id="mode-seg">
+          <button data-v="record" class="on">Record</button>
+          <button data-v="inject">Inject</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <label>camera host</label>
+        <input type="text" id="camera_host" placeholder="192.168.1.108" />
+      </div>
+      <div class="row">
+        <label>camera port</label>
+        <input type="number" id="camera_port" value="554" />
+      </div>
+      <div class="row">
+        <label>listen bind</label>
+        <input type="text" id="bind" value="0.0.0.0" />
+      </div>
+      <div class="row">
+        <label>listen port</label>
+        <input type="number" id="listen_port" value="554" />
+      </div>
+      <div class="row">
+        <label>capture file</label>
+        <input type="text" id="capture_file" value="captured.rtp" />
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 id="mode-opts-title">Record options</h2>
+
+      <!-- RECORD-only options -->
+      <div id="opts-record">
+        <div class="row">
+          <label>stop after</label>
+          <input type="number" id="capture_frames" value="0" min="0" placeholder="0 = unlimited" />
+        </div>
+      </div>
+
+      <!-- INJECT-only options -->
+      <div id="opts-inject" style="display:none">
+        <div class="row">
+          <label>inject-only</label>
+          <label class="toggle" id="inject_only_toggle">
+            <input type="checkbox" id="inject_only" />
+            <span>suppress real stream</span>
+          </label>
+        </div>
+        <div class="row">
+          <label>inject delay</label>
+          <input type="number" id="inject_delay" value="3.0" step="0.5" min="0" />
+        </div>
+        <div class="row">
+          <label>inject fps</label>
+          <input type="number" id="inject_fps" value="25" step="1" min="1" />
+        </div>
+        <div class="row">
+          <label>inject ssrc</label>
+          <input type="text" id="inject_ssrc" placeholder="auto (0xdeadbeef …)" />
+        </div>
+        <div class="row">
+          <label>rtcp SR</label>
+          <input type="number" id="rtcp_sr_interval" value="5.0" step="0.5" min="0" />
+        </div>
+      </div>
+
+      <details>
+        <summary>advanced · tcpkill &amp; logging</summary>
+        <div>
+          <div class="row">
+            <label>tcpkill iface</label>
+            <input type="text" id="tcpkill_iface" placeholder="eth0 — empty to disable" />
+          </div>
+          <div class="row">
+            <label>tcpkill delay</label>
+            <input type="number" id="tcpkill_delay" value="2.0" step="0.5" min="0" />
+          </div>
+          <div class="row">
+            <label>log level</label>
+            <input type="text" id="log_level" value="info" placeholder="trace|debug|info|warn|error" />
+          </div>
+        </div>
+      </details>
+
+      <div class="controls">
+        <button class="btn primary" id="btn-start">Start</button>
+        <button class="btn danger"  id="btn-stop">Stop</button>
+        <button class="btn"         id="btn-restart">Restart</button>
+      </div>
+
+      <div class="cmdline" id="cmdline">(not running)</div>
+    </div>
+    </div>
+
+    <!-- ========== RIGHT: logs ========== -->
+    <div>
+    <div class="card">
+      <div class="log-head">
+        <h2 style="margin:0">Proxy log</h2>
+        <div class="log-controls">
+          <label class="toggle">
+            <input type="checkbox" id="autoscroll" checked />
+            <span>auto-scroll</span>
+          </label>
+          <input type="text" id="filter" placeholder="filter…" />
+          <button class="btn" id="btn-clear" style="padding:5px 10px;font-size:12px">clear</button>
+        </div>
+      </div>
+      <div id="log"></div>
+    </div>
+    </div>
+
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+
+const $ = id => document.getElementById(id);
+
+// ---- state ----
+let mode = "record";
+let logFilter = "";
+let autoscroll = true;
+
+// ---- UI wiring ----
+for (const btn of $("mode-seg").querySelectorAll("button")) {
+  btn.addEventListener("click", () => setMode(btn.dataset.v));
+}
+function setMode(m) {
+  mode = m;
+  for (const btn of $("mode-seg").querySelectorAll("button")) {
+    btn.classList.toggle("on", btn.dataset.v === m);
+  }
+  $("opts-record").style.display = m === "record" ? "" : "none";
+  $("opts-inject").style.display = m === "inject" ? "" : "none";
+  $("mode-opts-title").textContent = (m === "record" ? "Record" : "Inject") + " options";
+}
+
+$("inject_only").addEventListener("change", e => {
+  $("inject_only_toggle").classList.toggle("on", e.target.checked);
+});
+
+$("autoscroll").addEventListener("change", e => { autoscroll = e.target.checked; });
+$("filter").addEventListener("input", e => {
+  logFilter = e.target.value.toLowerCase();
+  for (const line of $("log").children) {
+    line.style.display = (!logFilter || line.textContent.toLowerCase().indexOf(logFilter) >= 0)
+      ? "" : "none";
+  }
+});
+$("btn-clear").addEventListener("click", () => { $("log").innerHTML = ""; });
+
+$("btn-start").addEventListener("click", () => start());
+$("btn-stop").addEventListener("click",  () => stop());
+$("btn-restart").addEventListener("click", async () => { await stop(); await start(); });
+
+// ---- API ----
+function readConfig() {
+  const cfg = {
+    mode,
+    camera_host: $("camera_host").value.trim(),
+    camera_port: parseInt($("camera_port").value || "554", 10),
+    bind:        $("bind").value.trim(),
+    listen_port: parseInt($("listen_port").value || "554", 10),
+    capture_file: $("capture_file").value.trim(),
+  };
+  if (mode === "record") {
+    const n = parseInt($("capture_frames").value || "0", 10);
+    if (n > 0) cfg.capture_frames = n;
+  } else {
+    cfg.inject_only      = $("inject_only").checked;
+    cfg.inject_delay     = parseFloat($("inject_delay").value || "3.0");
+    cfg.inject_fps       = parseFloat($("inject_fps").value || "25");
+    const ssrc = $("inject_ssrc").value.trim();
+    if (ssrc) cfg.inject_ssrc = ssrc;
+    cfg.rtcp_sr_interval = parseFloat($("rtcp_sr_interval").value || "5.0");
+  }
+  const iface = $("tcpkill_iface").value.trim();
+  if (iface) {
+    cfg.tcpkill_iface = iface;
+    cfg.tcpkill_delay = parseFloat($("tcpkill_delay").value || "2.0");
+  }
+  const lvl = $("log_level").value.trim();
+  if (lvl) cfg.log_level = lvl;
+  return cfg;
+}
+
+async function start() {
+  const cfg = readConfig();
+  if (!cfg.camera_host) { toast("err", "camera host is required"); return; }
+  try {
+    const r = await fetch("/api/start", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(cfg),
+    });
+    const j = await r.json();
+    if (!r.ok) { toast("err", j.error || ("HTTP " + r.status)); return; }
+    applyStatus(j);
+    toast("ok", "proxy started · pid " + j.pid);
+  } catch (e) {
+    toast("err", "start failed: " + e);
+  }
+}
+
+async function stop() {
+  try {
+    const r = await fetch("/api/stop", { method: "POST" });
+    const j = await r.json();
+    applyStatus(j);
+    if (r.ok) toast("ok", "proxy stopped");
+    else toast("err", j.error || ("HTTP " + r.status));
+  } catch (e) {
+    toast("err", "stop failed: " + e);
+  }
+}
+
+async function pollStatus() {
+  try {
+    const r = await fetch("/api/status");
+    if (r.ok) applyStatus(await r.json());
+  } catch (e) { /* ignore transient fetch errors */ }
+}
+
+function applyStatus(s) {
+  const chip = $("status-chip");
+  chip.classList.toggle("running", !!s.running);
+  chip.classList.toggle("error", !s.running && s.exit_code != null && s.exit_code !== 0);
+  $("state-val").textContent = s.running ? "running"
+                              : (s.exit_code != null ? ("exited " + s.exit_code) : "stopped");
+  $("pid-val").textContent = s.pid ?? "—";
+  $("up-val").textContent = s.running ? fmtUptime(s.uptime) : "—";
+  $("cmdline").textContent = s.cmdline
+    ? s.cmdline.map(a => /\s/.test(a) ? JSON.stringify(a) : a).join(" ")
+    : "(not running)";
+  $("btn-start").disabled = !!s.running;
+  $("btn-stop").disabled  = !s.running;
+}
+
+function fmtUptime(sec) {
+  sec = Math.round(sec);
+  if (sec < 60) return sec + "s";
+  const m = Math.floor(sec / 60), ss = sec % 60;
+  if (m < 60) return m + "m " + ss + "s";
+  const h = Math.floor(m / 60), mm = m % 60;
+  return h + "h " + mm + "m";
+}
+
+// ---- toast ----
+function toast(kind, msg) {
+  const el = document.createElement("div");
+  el.className = "t " + kind;
+  el.textContent = msg;
+  $("toast").appendChild(el);
+  setTimeout(() => {
+    el.style.opacity = "0";
+    el.style.transition = "opacity 240ms";
+    setTimeout(() => el.remove(), 260);
+  }, 3400);
+}
+
+// ---- log tail (NDJSON over chunked HTTP) ----
+async function tailLogs() {
+  while (true) {
+    try {
+      const r = await fetch("/api/logs");
+      if (!r.ok || !r.body) throw new Error("HTTP " + r.status);
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      let buf = "";
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) throw new Error("log stream closed");
+        buf += dec.decode(value, { stream: true });
+        let i;
+        while ((i = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, i);
+          buf = buf.slice(i + 1);
+          if (!line.trim()) continue;
+          try { appendLog(JSON.parse(line)); } catch (e) { /* keepalive / junk */ }
+        }
+      }
+    } catch (e) {
+      appendLog({ ts: Date.now()/1000, src: "dash", line: "[log stream dropped: " + e.message + " — retrying in 2s]" });
+      await new Promise(r => setTimeout(r, 2000));
+    }
+  }
+}
+
+function appendLog(e) {
+  const log = $("log");
+  const line = document.createElement("div");
+  line.className = "line " + (e.src || "out");
+  const ts = new Date(e.ts * 1000).toISOString().slice(11, 19);
+  const tSpan = document.createElement("span"); tSpan.className = "t"; tSpan.textContent = ts;
+  const mSpan = document.createElement("span"); mSpan.className = "m"; mSpan.textContent = e.line;
+  line.appendChild(tSpan); line.appendChild(mSpan);
+  if (logFilter && line.textContent.toLowerCase().indexOf(logFilter) < 0) line.style.display = "none";
+  log.appendChild(line);
+  // Cap the DOM at 2000 lines so the viewer doesn't drag over long runs.
+  while (log.children.length > 2000) log.removeChild(log.firstChild);
+  if (autoscroll) log.scrollTop = log.scrollHeight;
+}
+
+// ---- boot ----
+setMode("record");
+pollStatus();
+setInterval(pollStatus, 1500);
+tailLogs();
+</script>
+</body>
+</html>
