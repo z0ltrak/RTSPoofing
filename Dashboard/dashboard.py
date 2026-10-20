@@ -1,30 +1,33 @@
 #!/usr/bin/env python3
 """
-RTSPoofing proxy dashboard — localhost web GUI to drive the Rust proxy
-without touching the terminal mid-demo.
+RTSPoofing dashboard — localhost web GUI to drive the Rust proxy and the
+`arpspoof` processes that redirect the NVR↔camera traffic through it.
 
 Behaviour:
 
     * Serves a single-page viewer at /, in Dashboard/web/index.html.
-    * Spawns, stops and restarts the `rtspoofing` binary with the arguments
-      the page sent (record/inject mode, camera host/port, listen port,
-      capture file, inject tunables, tcpkill opts…).
-    * Fans the proxy's stdout+stderr out to any connected browser via a
-      long-lived chunked response at /api/logs — same pattern as the NVR
-      viewer's /stream.
-    * Keeps a ring buffer of the last N log lines so a fresh connect can
-      paint recent history immediately.
-    * All stdlib — no pip install. The only external dependency is the
-      proxy binary itself; path is passed with --proxy-binary.
+    * Owns at most one `rtspoofing` subprocess at a time (record / inject
+      mode, with every CLI flag exposed on the page).
+    * Owns at most two `arpspoof` subprocesses at a time — one poisoning
+      the NVR (pretending to be the camera) and one poisoning the camera
+      (pretending to be the NVR). Direction is selectable.
+    * Fans the stdout+stderr of every subprocess out to any connected
+      browser via a long-lived chunked response at /api/logs (NDJSON).
+      Each entry carries a `src` tag ("proxy-out", "proxy-err",
+      "arp-nvr", "arp-cam", "dash") so the page can colour-code them.
+    * Keeps a ring buffer of the last N log lines so a fresh connect
+      can paint recent history immediately.
+    * All stdlib — no pip install. External deps are the proxy binary
+      (--proxy-binary) and `arpspoof` from dsniff (--arpspoof-binary).
 
 Scope:
 
-    * One proxy process at a time per dashboard. Starting a new one with a
-      process already running stops the running one first.
-    * Only loopback by default; bind host is overridable with --host for
-      lab-only remote access. The dashboard launches arbitrary subprocesses
-      with user-supplied arguments, so putting it on 0.0.0.0 means handing
-      shell access to anyone on the LAN. Document loudly.
+    * One proxy process and up to two arpspoof processes per dashboard.
+    * Loopback-only by default; the dashboard launches arbitrary
+      subprocesses with user-supplied arguments, so exposing it on
+      0.0.0.0 hands shell access to anyone on the LAN. Document loudly.
+    * Arpspoof needs raw sockets — run the dashboard with sudo, or
+      `setcap cap_net_raw+ep` the arpspoof binary once.
 
 Usage:
 
@@ -36,13 +39,14 @@ from __future__ import annotations
 
 import argparse
 import http.server
+import ipaddress
 import json
 import logging
 import os
 import shlex
+import shutil
 import signal
 import socket
-import struct
 import subprocess
 import threading
 import time
@@ -56,29 +60,139 @@ log = logging.getLogger("dashboard")
 WEB_DIR = Path(__file__).resolve().parent / "web"
 
 
+# ---------- Shared log fan-out ----------
+
+class LogBus:
+    """
+    Thread-safe log fan-out: one ring buffer + per-subscriber queues.
+    Every subprocess controller writes through here, and /api/logs just
+    subscribes.
+    """
+
+    def __init__(self, ring_size: int = 2000) -> None:
+        self._ring_size = ring_size
+        self._lock = threading.Lock()
+        self._ring: list[dict] = []
+        self._subs: list["Queue[dict]"] = []
+
+    def emit(self, src: str, line: str) -> None:
+        entry = {"ts": time.time(), "src": src, "line": line}
+        with self._lock:
+            self._ring.append(entry)
+            if len(self._ring) > self._ring_size:
+                # Trim in chunks so the common path is append-only.
+                del self._ring[: len(self._ring) - self._ring_size + 200]
+            for sub in list(self._subs):
+                try:
+                    sub.put_nowait(entry)
+                except Full:
+                    # Slow consumer: drop oldest to keep the live tail flowing.
+                    try:
+                        sub.get_nowait()
+                    except Empty:
+                        pass
+                    try:
+                        sub.put_nowait(entry)
+                    except Full:
+                        pass
+
+    def subscribe(self) -> "Queue[dict]":
+        q: "Queue[dict]" = Queue(maxsize=1024)
+        with self._lock:
+            for entry in self._ring[-200:]:
+                try:
+                    q.put_nowait(entry)
+                except Full:
+                    break
+            self._subs.append(q)
+        return q
+
+    def unsubscribe(self, q: "Queue[dict]") -> None:
+        with self._lock:
+            try:
+                self._subs.remove(q)
+            except ValueError:
+                pass
+
+
+# ---------- Subprocess helpers ----------
+
+def _popen(argv: list[str]) -> subprocess.Popen:
+    return subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,              # line-buffered
+        text=True,
+        errors="replace",
+        # New session so Ctrl-C on the dashboard doesn't propagate to the
+        # child; we manage its lifetime explicitly.
+        start_new_session=True,
+    )
+
+
+def _stop_proc(proc: subprocess.Popen, bus: LogBus, label: str, reason: str) -> None:
+    if proc.poll() is not None:
+        return
+    bus.emit(label, f"stopping (pid={proc.pid}, reason={reason})")
+    try:
+        # SIGTERM the whole process group so any grandchild (e.g. tcpkill)
+        # dies with the parent.
+        pg = os.getpgid(proc.pid)
+        os.killpg(pg, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    try:
+        proc.wait(timeout=3)
+    except subprocess.TimeoutExpired:
+        bus.emit(label, "SIGTERM timed out; sending SIGKILL")
+        try:
+            pg = os.getpgid(proc.pid)
+            os.killpg(pg, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        try:
+            proc.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            pass
+
+
+def _reader_thread(stream, bus: LogBus, label: str) -> None:
+    try:
+        for line in iter(stream.readline, ""):
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            bus.emit(label, line)
+    except (ValueError, OSError):
+        # Stream closed under us during shutdown; expected.
+        pass
+    finally:
+        try:
+            stream.close()
+        except OSError:
+            pass
+
+
 # ---------- Proxy process controller ----------
 
 class ProxyController:
-    """
-    Owns at most one running `rtspoofing` subprocess. Thread-safe; the HTTP
-    handler threads and the log-reader threads all touch it concurrently.
-    """
+    """Owns at most one running `rtspoofing` subprocess."""
 
-    LOG_RING = 2000  # recent lines kept for new log subscribers
+    _MODES = {"record", "inject"}
+    _LOG_LEVELS = {"trace", "debug", "info", "warn", "error"}
 
-    def __init__(self, binary: Path) -> None:
+    def __init__(self, binary: Path, bus: LogBus) -> None:
         self.binary = binary
+        self.bus = bus
         self._proc: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
         self._cmdline: Optional[list[str]] = None
         self._started_at: float = 0.0
-
-        # Log fan-out: ring buffer + per-subscriber queues.
-        self._log_lock = threading.Lock()
-        self._log_ring: list[dict] = []
-        self._log_subs: list["Queue[dict]"] = []
-
-    # ---- public API ----
 
     def status(self) -> dict:
         with self._lock:
@@ -93,37 +207,24 @@ class ProxyController:
             }
 
     def start(self, args: dict) -> dict:
-        """
-        Spawn a new proxy. If one is already running it's stopped first,
-        so a POST /api/start always leaves exactly one proxy running (or
-        none, if it crashed on launch).
-        """
         argv = self._build_argv(args)
         with self._lock:
             self._stop_locked(reason="restart")
-            self._emit("dash", "spawning: " + " ".join(shlex.quote(a) for a in argv))
+            self.bus.emit("dash", "spawning proxy: " + " ".join(shlex.quote(a) for a in argv))
             try:
-                proc = subprocess.Popen(
-                    argv,
-                    stdin=subprocess.DEVNULL,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    bufsize=1,                  # line-buffered
-                    text=True,
-                    errors="replace",
-                    # New session so Ctrl-C on the dashboard doesn't propagate
-                    # to the proxy; we manage its lifetime explicitly.
-                    start_new_session=True,
-                )
+                proc = _popen(argv)
             except FileNotFoundError as e:
-                self._emit("dash", f"spawn failed: {e}")
+                self.bus.emit("dash", f"proxy spawn failed: {e}")
                 raise
             self._proc = proc
             self._cmdline = argv
             self._started_at = time.time()
-            # Readers: one per stream, daemon so interpreter exit doesn't block.
-            threading.Thread(target=self._reader, args=(proc.stdout, "out"), daemon=True).start()
-            threading.Thread(target=self._reader, args=(proc.stderr, "err"), daemon=True).start()
+            threading.Thread(target=_reader_thread,
+                             args=(proc.stdout, self.bus, "proxy-out"),
+                             daemon=True).start()
+            threading.Thread(target=_reader_thread,
+                             args=(proc.stderr, self.bus, "proxy-err"),
+                             daemon=True).start()
             threading.Thread(target=self._wait_exit, args=(proc,), daemon=True).start()
         return self.status()
 
@@ -132,109 +233,22 @@ class ProxyController:
             self._stop_locked(reason="user")
         return self.status()
 
-    # ---- log API ----
-
-    def subscribe(self) -> "Queue[dict]":
-        """Return a Queue the caller reads log entries from until unsubscribe."""
-        q: "Queue[dict]" = Queue(maxsize=1024)
-        with self._log_lock:
-            # Prime with recent history so a new connection has context.
-            for entry in self._log_ring[-200:]:
-                try:
-                    q.put_nowait(entry)
-                except Full:
-                    break
-            self._log_subs.append(q)
-        return q
-
-    def unsubscribe(self, q: "Queue[dict]") -> None:
-        with self._log_lock:
-            try:
-                self._log_subs.remove(q)
-            except ValueError:
-                pass
-
     # ---- internals ----
 
     def _stop_locked(self, reason: str) -> None:
         if self._proc is None:
             return
-        if self._proc.poll() is None:
-            self._emit("dash", f"stopping proxy (pid={self._proc.pid}, reason={reason})")
-            try:
-                # SIGTERM to the whole process group so any child tcpkill
-                # dies with it.
-                pg = os.getpgid(self._proc.pid)
-                os.killpg(pg, signal.SIGTERM)
-            except (ProcessLookupError, PermissionError):
-                try:
-                    self._proc.terminate()
-                except OSError:
-                    pass
-            try:
-                self._proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self._emit("dash", "SIGTERM timed out; sending SIGKILL")
-                try:
-                    pg = os.getpgid(self._proc.pid)
-                    os.killpg(pg, signal.SIGKILL)
-                except (ProcessLookupError, PermissionError):
-                    self._proc.kill()
-                try:
-                    self._proc.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    pass
-        # Leave self._proc assigned so status() can still report the final
-        # exit code the next time anyone asks — _start_locked overwrites it.
-
-    def _reader(self, stream, label: str) -> None:
-        try:
-            for line in iter(stream.readline, ""):
-                line = line.rstrip("\n")
-                if not line:
-                    continue
-                self._emit(label, line)
-        except (ValueError, OSError):
-            # Stream closed under us during shutdown; expected.
-            pass
-        finally:
-            try:
-                stream.close()
-            except OSError:
-                pass
+        _stop_proc(self._proc, self.bus, "dash", reason)
 
     def _wait_exit(self, proc: subprocess.Popen) -> None:
         rc = proc.wait()
-        self._emit("dash", f"proxy exited (pid={proc.pid}, rc={rc})")
-
-    def _emit(self, src: str, line: str) -> None:
-        entry = {"ts": time.time(), "src": src, "line": line}
-        with self._log_lock:
-            self._log_ring.append(entry)
-            if len(self._log_ring) > self.LOG_RING:
-                del self._log_ring[: len(self._log_ring) - self.LOG_RING + 200]
-            for sub in list(self._log_subs):
-                try:
-                    sub.put_nowait(entry)
-                except Full:
-                    # Slow consumer: drop oldest to keep live tail flowing.
-                    try:
-                        sub.get_nowait()
-                    except Empty:
-                        pass
-                    try:
-                        sub.put_nowait(entry)
-                    except Full:
-                        pass
+        self.bus.emit("dash", f"proxy exited (pid={proc.pid}, rc={rc})")
 
     # ---- argv builder ----
     #
     # Keep this in lock-step with RE/src/main.rs Cli. Only pass flags the
     # user actually set; leave the rest to the proxy's own defaults so a
     # typo in the dashboard doesn't silently change proxy behaviour.
-
-    _MODES = {"record", "inject"}
-    _LOG_LEVELS = {"trace", "debug", "info", "warn", "error"}
 
     def _build_argv(self, args: dict) -> list[str]:
         mode = str(args.get("mode", "")).lower()
@@ -291,6 +305,142 @@ class ProxyController:
         return argv
 
 
+# ---------- Arpspoof controller ----------
+
+class ArpspoofController:
+    """
+    Owns up to two running `arpspoof` subprocesses:
+
+        nvr  — poison NVR,    pretending to be the camera (arpspoof -t NVR CAM)
+        cam  — poison camera, pretending to be the NVR    (arpspoof -t CAM NVR)
+
+    Direction selector: "nvr" | "cam" | "both" (both is the standard
+    MITM setup documented in the project README).
+
+    Needs raw sockets — run the dashboard with sudo, or `setcap
+    cap_net_raw+ep` the arpspoof binary.
+    """
+
+    _DIRECTIONS = ("nvr", "cam", "both")
+
+    def __init__(self, binary: str, bus: LogBus) -> None:
+        self.binary = binary
+        self.bus = bus
+        self._lock = threading.Lock()
+        self._procs: dict[str, subprocess.Popen] = {}
+        self._cmdlines: dict[str, list[str]] = {}
+        self._started_at: dict[str, float] = {}
+        self._last_exit: dict[str, Optional[int]] = {}
+
+    # ---- public API ----
+
+    def status(self) -> dict:
+        with self._lock:
+            legs: dict[str, dict] = {}
+            for leg in ("nvr", "cam"):
+                proc = self._procs.get(leg)
+                running = proc is not None and proc.poll() is None
+                legs[leg] = {
+                    "running": bool(running),
+                    "pid": proc.pid if running else None,
+                    "uptime": round(time.time() - self._started_at.get(leg, 0.0), 1) if running else 0,
+                    "cmdline": list(self._cmdlines.get(leg, [])) or None,
+                    "exit_code": (proc.returncode if proc and not running else None)
+                                 if proc else self._last_exit.get(leg),
+                }
+            any_running = any(l["running"] for l in legs.values())
+            return {
+                "running": any_running,
+                "legs": legs,
+                "binary": self.binary,
+                "resolvable": shutil.which(self.binary) is not None
+                               or (os.path.isabs(self.binary) and os.access(self.binary, os.X_OK)),
+            }
+
+    def start(self, args: dict) -> dict:
+        iface = str(args.get("iface", "")).strip()
+        nvr_ip = str(args.get("nvr_ip", "")).strip()
+        cam_ip = str(args.get("cam_ip", "")).strip()
+        direction = str(args.get("direction", "both")).strip().lower() or "both"
+
+        if not iface:
+            raise ValueError("iface is required")
+        if not nvr_ip:
+            raise ValueError("nvr_ip is required")
+        if not cam_ip:
+            raise ValueError("cam_ip is required")
+        if direction not in self._DIRECTIONS:
+            raise ValueError(f"direction must be one of {sorted(self._DIRECTIONS)}")
+        _validate_ip(nvr_ip, "nvr_ip")
+        _validate_ip(cam_ip, "cam_ip")
+        if nvr_ip == cam_ip:
+            raise ValueError("nvr_ip and cam_ip must differ")
+
+        # Plan: direction → (target, impersonated_host)
+        plan: dict[str, tuple[str, str]] = {}
+        if direction in ("nvr", "both"):
+            plan["nvr"] = (nvr_ip, cam_ip)   # tell NVR we are the camera
+        if direction in ("cam", "both"):
+            plan["cam"] = (cam_ip, nvr_ip)   # tell camera we are the NVR
+
+        with self._lock:
+            self._stop_all_locked(reason="restart")
+            # Clear state for legs the new plan doesn't cover so the UI
+            # doesn't keep showing stale cmdlines/exit-codes from the
+            # previous run.
+            for leg in ("nvr", "cam"):
+                if leg not in plan:
+                    self._procs.pop(leg, None)
+                    self._cmdlines.pop(leg, None)
+                    self._started_at.pop(leg, None)
+                    self._last_exit.pop(leg, None)
+            for leg, (target, host) in plan.items():
+                argv = [self.binary, "-i", iface, "-t", target, host]
+                self.bus.emit("arp-" + leg,
+                              "spawning: " + " ".join(shlex.quote(a) for a in argv))
+                try:
+                    proc = _popen(argv)
+                except FileNotFoundError as e:
+                    self.bus.emit("arp-" + leg, f"spawn failed: {e}")
+                    raise
+                self._procs[leg] = proc
+                self._cmdlines[leg] = argv
+                self._started_at[leg] = time.time()
+                threading.Thread(target=_reader_thread,
+                                 args=(proc.stdout, self.bus, "arp-" + leg),
+                                 daemon=True).start()
+                threading.Thread(target=_reader_thread,
+                                 args=(proc.stderr, self.bus, "arp-" + leg),
+                                 daemon=True).start()
+                threading.Thread(target=self._wait_exit,
+                                 args=(proc, leg),
+                                 daemon=True).start()
+        return self.status()
+
+    def stop(self) -> dict:
+        with self._lock:
+            self._stop_all_locked(reason="user")
+        return self.status()
+
+    # ---- internals ----
+
+    def _stop_all_locked(self, reason: str) -> None:
+        for leg, proc in list(self._procs.items()):
+            _stop_proc(proc, self.bus, "arp-" + leg, reason)
+
+    def _wait_exit(self, proc: subprocess.Popen, leg: str) -> None:
+        rc = proc.wait()
+        self._last_exit[leg] = rc
+        self.bus.emit("arp-" + leg, f"exited (pid={proc.pid}, rc={rc})")
+
+
+def _validate_ip(s: str, label: str) -> None:
+    try:
+        ipaddress.ip_address(s)
+    except ValueError:
+        raise ValueError(f"{label}: {s!r} is not a valid IP") from None
+
+
 # ---------- HTTP server ----------
 
 class _ThreadingHTTPServer(http.server.ThreadingHTTPServer):
@@ -298,7 +448,7 @@ class _ThreadingHTTPServer(http.server.ThreadingHTTPServer):
     daemon_threads = True
 
 
-def _make_handler(controller: ProxyController):
+def _make_handler(proxy: ProxyController, arp: ArpspoofController, bus: LogBus):
     class Handler(http.server.BaseHTTPRequestHandler):
         # Reroute http.server's noisy default logging into our logger.
         def log_message(self, fmt: str, *args) -> None:  # noqa: A002, ARG002
@@ -311,7 +461,10 @@ def _make_handler(controller: ProxyController):
                 self._serve_static("index.html", "text/html; charset=utf-8")
                 return
             if self.path == "/api/status":
-                self._json(200, controller.status())
+                self._json(200, {
+                    "proxy": proxy.status(),
+                    "arp":   arp.status(),
+                })
                 return
             if self.path == "/api/logs":
                 self._serve_logs()
@@ -320,26 +473,40 @@ def _make_handler(controller: ProxyController):
 
         def do_POST(self) -> None:  # noqa: N802
             if self.path == "/api/start":
-                try:
-                    body = self._read_json()
-                    status = controller.start(body)
-                except ValueError as e:
-                    self._json(400, {"error": str(e)})
-                    return
-                except FileNotFoundError as e:
-                    self._json(500, {"error": f"proxy binary not found: {e}"})
-                    return
-                except OSError as e:
-                    self._json(500, {"error": f"spawn failed: {e}"})
-                    return
-                self._json(200, status)
+                self._handle(lambda b: proxy.start(b))
                 return
             if self.path == "/api/stop":
-                self._json(200, controller.stop())
+                self._json(200, proxy.stop())
+                return
+            if self.path == "/api/arp/start":
+                self._handle(lambda b: arp.start(b))
+                return
+            if self.path == "/api/arp/stop":
+                self._json(200, arp.stop())
+                return
+            if self.path == "/api/stop_all":
+                arp.stop()
+                proxy.stop()
+                self._json(200, {"proxy": proxy.status(), "arp": arp.status()})
                 return
             self.send_error(404, "not found")
 
         # ---- helpers ----
+
+        def _handle(self, fn) -> None:
+            try:
+                body = self._read_json()
+                result = fn(body)
+            except ValueError as e:
+                self._json(400, {"error": str(e)})
+                return
+            except FileNotFoundError as e:
+                self._json(500, {"error": f"binary not found: {e}"})
+                return
+            except OSError as e:
+                self._json(500, {"error": f"spawn failed: {e}"})
+                return
+            self._json(200, result)
 
         def _read_json(self) -> dict:
             length = int(self.headers.get("Content-Length", "0"))
@@ -399,14 +566,14 @@ def _make_handler(controller: ProxyController):
             except OSError:
                 pass
 
-            q = controller.subscribe()
+            q = bus.subscribe()
             try:
                 while True:
                     try:
                         entry = q.get(timeout=1.0)
                     except Empty:
-                        # Idle keepalive — a comment line keeps NAT/proxies open
-                        # without appearing in the parsed stream (newline-only).
+                        # Idle keepalive — a bare newline keeps NAT/proxies open
+                        # without appearing in the parsed stream.
                         if not self._send_chunk(b"\n"):
                             break
                         continue
@@ -414,7 +581,7 @@ def _make_handler(controller: ProxyController):
                     if not self._send_chunk(payload):
                         break
             finally:
-                controller.unsubscribe(q)
+                bus.unsubscribe(q)
                 try:
                     self.wfile.write(b"0\r\n\r\n"); self.wfile.flush()
                 except (BrokenPipeError, ConnectionResetError, OSError):
@@ -437,17 +604,19 @@ def _make_handler(controller: ProxyController):
 
 def parse_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(
-        description="Localhost web GUI to drive the rtspoofing proxy.",
+        description="Localhost web GUI to drive the rtspoofing proxy and arpspoof.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
-            "The dashboard launches rtspoofing subprocesses with the arguments\n"
-            "sent by the browser. Keep --host loopback-only in untrusted LANs:\n"
-            "exposing this on 0.0.0.0 lets any machine on the network pick the\n"
-            "args and spawn the proxy under your account.\n"
+            "The dashboard launches rtspoofing and arpspoof subprocesses with\n"
+            "the arguments sent by the browser. Keep --host loopback-only on\n"
+            "untrusted LANs: exposing this on 0.0.0.0 lets any machine on the\n"
+            "network spawn these processes under your account.\n"
         ),
     )
     ap.add_argument("--proxy-binary", default="../RE/target/release/rtspoofing",
                     help="path to the rtspoofing binary (default: ../RE/target/release/rtspoofing)")
+    ap.add_argument("--arpspoof-binary", default="arpspoof",
+                    help="arpspoof binary or absolute path (default: arpspoof — resolved via PATH)")
     ap.add_argument("--host", default="127.0.0.1",
                     help="bind host for the dashboard (default: 127.0.0.1)")
     ap.add_argument("--port", type=int, default=8090,
@@ -473,8 +642,19 @@ def main() -> int:
         log.error("proxy binary at %s is not executable", binary)
         return 1
 
-    controller = ProxyController(binary)
-    handler_cls = _make_handler(controller)
+    # arpspoof is only required when the user actually clicks Start on the
+    # ARP panel; we don't fail-fast if it's missing. Just warn so the user
+    # sees it in the terminal, and the UI will show "not found" too.
+    if shutil.which(args.arpspoof_binary) is None and not (
+        os.path.isabs(args.arpspoof_binary) and os.access(args.arpspoof_binary, os.X_OK)
+    ):
+        log.warning("arpspoof not found on PATH (%s) — ARP panel will error on Start until it is installed",
+                    args.arpspoof_binary)
+
+    bus = LogBus()
+    proxy = ProxyController(binary, bus)
+    arp = ArpspoofController(args.arpspoof_binary, bus)
+    handler_cls = _make_handler(proxy, arp, bus)
 
     try:
         server = _ThreadingHTTPServer((args.host, args.port), handler_cls)
@@ -482,13 +662,15 @@ def main() -> int:
         log.error("cannot bind %s:%d: %s", args.host, args.port, e)
         return 1
 
-    log.info("dashboard at http://%s:%d/   (proxy=%s)", args.host, args.port, binary)
+    log.info("dashboard at http://%s:%d/   (proxy=%s, arpspoof=%s)",
+             args.host, args.port, binary, args.arpspoof_binary)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info("Ctrl-C — shutting down")
     finally:
-        controller.stop()
+        arp.stop()
+        proxy.stop()
         server.server_close()
     return 0
 
