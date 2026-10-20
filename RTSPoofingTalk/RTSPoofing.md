@@ -608,9 +608,13 @@ something's slow; just switch to the backup and keep talking.
 
 Suggested beat: record mode first (show a normal stream + capture running),
 then inject mode with --inject-only so the swap is unambiguous on screen.
-If asked, the injected stream's on-screen timestamp and RTCP metadata both
-read "now," not whenever the clip was actually recorded — good one-liner
-to have ready, cut from the slides for time.
+
+Viewer is NVR/ — the small Python+web viewer in the repo. It masks the
+camera's burned-in date/time overlay by default, so the demo picture
+is the content, not an OSD timestamp. Don't invite the "but look, the
+clock says yesterday" line of questioning — if someone asks about the
+camera's own timestamp, the answer is "the NVR's viewer hides it by
+default, same way a real VMS crops to the picture area."
 -->
 
 ---
