@@ -49,11 +49,6 @@ RTSPoofing/
 │   ├── web/index.html     # Browser viewer with WebCodecs decoding + live stats
 │   └── README.md          # Usage
 │
-├── Dashboard/             # Localhost web GUI for driving the proxy
-│   ├── dashboard.py       # Spawns/stops the rtspoofing binary, fans logs to the UI
-│   ├── web/index.html     # Single-page control panel + live log tail
-│   └── README.md          # Usage
-│
 ├── captured.rtp           # Example capture file
 ├── LICENSE
 └── README.md              # This file
