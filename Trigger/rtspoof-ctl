@@ -1,0 +1,395 @@
+#!/usr/bin/env python3
+"""
+rtspoof-ctl — one-shot CLI for driving the RTSPoofing proxy from a shell
+(or from a button). No daemon, no web UI: each invocation reads a saved
+config, flips the proxy on or off, and exits.
+
+Subcommands:
+
+    spoof    start the proxy with the saved [proxy] args (idempotent)
+    normal   stop the proxy — traffic goes back to whatever it was
+    toggle   flip whichever state we're currently in
+    status   print whether the proxy is running (+ pid, uptime)
+    logs     show (or tail with -f) the proxy's stdout/stderr
+
+State lives in two files you set in config.ini:
+
+    pid_file   where the running proxy's PID is stashed
+    log_file   where the proxy's stdout+stderr get appended
+
+Both default to /tmp/rtspoof-ctl.{pid,log}. On every call we re-check the
+PID is still alive and clear stale files; a hard reboot or kill -9 is
+recoverable.
+
+The config file is INI (stdlib configparser). See config.example.ini for
+every key. All relative paths in it are resolved against the config file's
+own directory, so a repo-relative `binary = ../RE/target/release/rtspoofing`
+works regardless of where you run this from.
+"""
+
+from __future__ import annotations
+
+import argparse
+import configparser
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_CONFIG = HERE / "config.ini"
+
+
+# ---- small helpers --------------------------------------------------------
+
+def die(msg: str, code: int = 2) -> "None":
+    print(f"rtspoof-ctl: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def load_config(path: Path) -> configparser.ConfigParser:
+    cp = configparser.ConfigParser()
+    if not cp.read(path):
+        die(f"config not found: {path}  (copy config.example.ini → config.ini)")
+    if "proxy" not in cp:
+        die(f"config missing [proxy] section: {path}")
+    return cp
+
+
+def resolve_rel(base_dir: Path, p: str) -> Path:
+    """Resolve a path from the config relative to the config file's directory."""
+    pp = Path(p).expanduser()
+    return pp if pp.is_absolute() else (base_dir / pp).resolve()
+
+
+def pid_file(cp: configparser.ConfigParser) -> Path:
+    return Path(cp.get("runtime", "pid_file",
+                       fallback="/tmp/rtspoof-ctl.pid")).expanduser()
+
+
+def log_file(cp: configparser.ConfigParser) -> Path:
+    return Path(cp.get("runtime", "log_file",
+                       fallback="/tmp/rtspoof-ctl.log")).expanduser()
+
+
+# ---- PID / liveness bookkeeping ------------------------------------------
+
+def read_pid(cp: configparser.ConfigParser) -> int | None:
+    try:
+        txt = pid_file(cp).read_text().strip()
+        return int(txt) if txt else None
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+
+
+def is_alive(pid: int | None) -> bool:
+    if pid is None or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Process exists, we just don't own it.
+        return True
+
+
+def clear_pid(cp: configparser.ConfigParser) -> None:
+    try:
+        pid_file(cp).unlink()
+    except FileNotFoundError:
+        pass
+
+
+def running_pid(cp: configparser.ConfigParser) -> int | None:
+    """Return the PID of the proxy if running, else None (clearing stale file)."""
+    pid = read_pid(cp)
+    if is_alive(pid):
+        return pid
+    if pid is not None:
+        clear_pid(cp)
+    return None
+
+
+def write_pid(cp: configparser.ConfigParser, pid: int) -> None:
+    pf = pid_file(cp)
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(str(pid))
+
+
+# ---- argv construction ----------------------------------------------------
+#
+# Mirrors RE/src/main.rs Cli. Only pass flags the config actually sets;
+# leave the rest to the proxy's defaults so a missing key doesn't silently
+# change behaviour.
+
+_STR_FLAGS = [
+    ("mode",             "--mode"),
+    ("bind",             "--bind"),
+    ("camera_host",      "--camera-host"),
+    ("capture_file",     "--capture-file"),
+    ("inject_ssrc",      "--inject-ssrc"),
+    ("tcpkill_iface",    "--tcpkill-iface"),
+    ("log_level",        "--log-level"),
+]
+_INT_FLAGS = [
+    ("listen_port",      "--listen-port"),
+    ("camera_port",      "--camera-port"),
+    ("capture_frames",   "--capture-frames"),
+]
+_FLOAT_FLAGS = [
+    ("inject_delay",     "--inject-delay"),
+    ("inject_fps",       "--inject-fps"),
+    ("rtcp_sr_interval", "--rtcp-sr-interval"),
+    ("tcpkill_delay",    "--tcpkill-delay"),
+]
+_BOOL_FLAGS = [
+    ("inject_only",      "--inject-only"),
+]
+
+
+def build_argv(cp: configparser.ConfigParser, config_dir: Path) -> list[str]:
+    sect = cp["proxy"]
+    if "binary" not in sect:
+        die("config [proxy] missing 'binary'")
+    binary = resolve_rel(config_dir, sect["binary"])
+    if not binary.exists():
+        die(f"proxy binary not found: {binary}  (cd RE && cargo build --release)")
+    if not os.access(binary, os.X_OK):
+        die(f"proxy binary not executable: {binary}")
+
+    # capture_file is also path-ish — if it's relative, resolve it against the
+    # config dir so the demo doesn't accidentally hit $CWD.
+    cap = sect.get("capture_file", "").strip()
+    if cap and not Path(cap).is_absolute() and cap not in ("/dev/null",):
+        sect["capture_file"] = str(resolve_rel(config_dir, cap))
+
+    argv: list[str] = [str(binary)]
+    for key, flag in _STR_FLAGS:
+        v = sect.get(key, "").strip()
+        if v:
+            argv.extend([flag, v])
+    for key, flag in _INT_FLAGS:
+        v = sect.get(key, "").strip()
+        if v:
+            try: argv.extend([flag, str(int(v))])
+            except ValueError: die(f"config [proxy].{key}: expected int, got {v!r}")
+    for key, flag in _FLOAT_FLAGS:
+        v = sect.get(key, "").strip()
+        if v:
+            try: argv.extend([flag, str(float(v))])
+            except ValueError: die(f"config [proxy].{key}: expected float, got {v!r}")
+    for key, flag in _BOOL_FLAGS:
+        if sect.getboolean(key, fallback=False):
+            argv.append(flag)
+    return argv
+
+
+# ---- subcommands ----------------------------------------------------------
+
+def cmd_spoof(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    pid = running_pid(cp)
+    if pid is not None:
+        print(f"already spoofing (pid={pid})")
+        return 0
+
+    argv = build_argv(cp, config_dir)
+    lf = log_file(cp)
+    lf.parent.mkdir(parents=True, exist_ok=True)
+    log = open(lf, "a", buffering=1)
+    log.write(f"\n--- spoof start {_now()} ---\n")
+    log.write(f"argv: {' '.join(_quote(a) for a in argv)}\n")
+    log.flush()
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=log,
+            # Separate process group so a USB-reset / tty-close doesn't
+            # take the proxy down with us.
+            start_new_session=True,
+            close_fds=True,
+        )
+    except OSError as e:
+        die(f"spawn failed: {e}")
+
+    # Guard against immediate crash (bad flag, port already bound, etc.).
+    # Give the proxy 300 ms to prove it's alive before claiming success.
+    time.sleep(0.3)
+    if proc.poll() is not None:
+        rc = proc.returncode
+        try:
+            tail = _tail_lines(lf, 10)
+        except OSError:
+            tail = ""
+        die(f"proxy exited immediately (rc={rc}). Last log lines:\n{tail}", code=1)
+
+    write_pid(cp, proc.pid)
+    print(f"spoofing · pid={proc.pid} · log={lf}")
+    return 0
+
+
+def cmd_normal(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    pid = running_pid(cp)
+    if pid is None:
+        print("already normal (not spoofing)")
+        return 0
+
+    try:
+        pg = os.getpgid(pid)
+        os.killpg(pg, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    # Wait up to 3s for a clean exit.
+    for _ in range(30):
+        if not is_alive(pid):
+            break
+        time.sleep(0.1)
+    else:
+        print("SIGTERM timed out; sending SIGKILL", file=sys.stderr)
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try: os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError: pass
+
+    clear_pid(cp)
+    try:
+        with open(log_file(cp), "a") as log:
+            log.write(f"--- normal (stopped pid={pid}) {_now()} ---\n")
+    except OSError:
+        pass
+    print(f"stopped (pid={pid})")
+    return 0
+
+
+def cmd_toggle(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    if running_pid(cp) is None:
+        return cmd_spoof(cp, config_dir)
+    return cmd_normal(cp, config_dir)
+
+
+def cmd_status(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    pid = running_pid(cp)
+    if pid is None:
+        print("state: normal (proxy not running)")
+        return 1   # non-zero so shell callers can branch on it
+    uptime = _proc_uptime(pid)
+    msg = f"state: spoofing · pid={pid}"
+    if uptime is not None:
+        msg += f" · up {_fmt_duration(uptime)}"
+    msg += f" · log={log_file(cp)}"
+    print(msg)
+    return 0
+
+
+def cmd_logs(cp: configparser.ConfigParser, args: argparse.Namespace) -> int:
+    path = log_file(cp)
+    if not path.exists():
+        print("(no log yet)")
+        return 0
+    tail = ["tail", "-n", str(args.n)]
+    if args.follow:
+        tail.append("-f")
+    tail.append(str(path))
+    try:
+        return subprocess.call(tail)
+    except FileNotFoundError:
+        # No tail(1): dump the whole thing instead.
+        print(path.read_text(), end="")
+        return 0
+    except KeyboardInterrupt:
+        return 130
+
+
+# ---- misc utilities -------------------------------------------------------
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _quote(s: str) -> str:
+    import shlex
+    return shlex.quote(s)
+
+
+def _tail_lines(path: Path, n: int) -> str:
+    with open(path, "rb") as f:
+        try:
+            f.seek(0, os.SEEK_END)
+            size = f.tell()
+            # Read the last ~8 KiB; good enough for a last-N-lines preview.
+            back = min(size, 8192)
+            f.seek(size - back)
+            data = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            data = ""
+    return "\n".join(data.splitlines()[-n:])
+
+
+def _proc_uptime(pid: int) -> float | None:
+    """Best-effort process uptime, via /proc on Linux."""
+    try:
+        return time.time() - os.stat(f"/proc/{pid}").st_mtime
+    except OSError:
+        return None
+
+
+def _fmt_duration(sec: float) -> str:
+    sec = int(sec)
+    if sec < 60:
+        return f"{sec}s"
+    m, s = divmod(sec, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m"
+
+
+# ---- entry point ----------------------------------------------------------
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="rtspoof-ctl",
+        description="One-shot CLI to flip the RTSPoofing proxy on and off.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("Config: ./config.ini next to this script, or --config PATH.\n"
+                "Copy config.example.ini first and edit the camera/host values."),
+    )
+    ap.add_argument("-c", "--config", default=str(DEFAULT_CONFIG),
+                    help=f"config file (default: {DEFAULT_CONFIG})")
+
+    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{spoof,normal,toggle,status,logs}")
+    sub.add_parser("spoof",  help="start the proxy with the saved inject args")
+    sub.add_parser("normal", help="stop the proxy — traffic goes back to normal")
+    sub.add_parser("toggle", help="flip between spoof and normal")
+    sub.add_parser("status", help="print whether the proxy is running")
+    p_logs = sub.add_parser("logs", help="show recent proxy output")
+    p_logs.add_argument("-n", type=int, default=50, help="lines to show (default 50)")
+    p_logs.add_argument("-f", "--follow", action="store_true", help="tail -f mode")
+
+    args = ap.parse_args(argv)
+
+    config_path = Path(args.config).expanduser().resolve()
+    config_dir = config_path.parent
+    cp = load_config(config_path)
+
+    if args.cmd == "spoof":  return cmd_spoof(cp, config_dir)
+    if args.cmd == "normal": return cmd_normal(cp, config_dir)
+    if args.cmd == "toggle": return cmd_toggle(cp, config_dir)
+    if args.cmd == "status": return cmd_status(cp, config_dir)
+    if args.cmd == "logs":   return cmd_logs(cp, args)
+    die(f"unknown subcommand: {args.cmd}")  # pragma: no cover
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

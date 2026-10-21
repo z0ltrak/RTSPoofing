@@ -49,6 +49,13 @@ RTSPoofing/
 │   ├── web/index.html     # Browser viewer with WebCodecs decoding + live stats
 │   └── README.md          # Usage
 │
+├── Trigger/               # One-shot CLI + ESP32 button trigger for live demos
+│   ├── rtspoof-ctl        # Python CLI: spoof / normal / toggle / status / logs
+│   ├── trigger-serial.sh  # Bash watcher — reads /dev/ttyACM0, dispatches the CLI
+│   ├── config.example.ini # Presaved proxy flags for the spoof state
+│   ├── esp32/button.ino   # Minimal ESP32 sketch (two buttons → serial lines)
+│   └── README.md          # Usage, wiring, troubleshooting
+│
 ├── captured.rtp           # Example capture file
 ├── LICENSE
 └── README.md              # This file
