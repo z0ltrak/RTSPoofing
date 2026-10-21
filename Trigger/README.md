@@ -117,6 +117,35 @@ That's it. The bridge sits in the foreground, prints each dispatched
 command, and exits cleanly on Ctrl-C. If you want it to survive
 logout, drop it into a systemd unit — or just `tmux`.
 
+### Testing the bridge without an ESP32
+
+If the hardware hasn't arrived yet, `socat` can hand you a pair of
+virtual serial ports — one for the bridge to listen on, one for you
+to type into (simulating button presses):
+
+```bash
+# terminal A — make a virtual pty pair
+socat -d -d pty,raw,echo=0 pty,raw,echo=0
+# prints two paths, e.g.:
+#   PTY is /dev/pts/5
+#   PTY is /dev/pts/6
+# leave this running
+
+# terminal B — point the bridge at one end
+sudo ./trigger-serial.sh /dev/pts/5 9600
+
+# terminal C — pretend to be the ESP32
+printf 'spoof\n'  > /dev/pts/6
+printf 'normal\n' > /dev/pts/6
+printf 'toggle\n' > /dev/pts/6
+```
+
+Each `printf` lands as one "button press" and the bridge prints
+`> spoof` / `> normal` / `> toggle` as it dispatches. When the real
+ESP32 shows up, replace `/dev/pts/5` with `/dev/ttyACM0` and the
+rest of the setup is identical — the sketch sends those exact
+lines.
+
 ### One-button variant
 
 If you only have one button on the panel, wire it to GPIO 32 and
