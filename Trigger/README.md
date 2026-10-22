@@ -5,13 +5,22 @@ one place, plus a serial bridge and an ESP32 sketch so a bystander at
 a congress can press a button and watch the camera feed change.
 
 ```
-   ┌─ ESP32 button ─┐   USB-serial   ┌─ trigger-serial.sh ─┐    exec    ┌─ rtspoof-ctl ─┐
-   │  GPIO 32 → "spoof"  ─────────▶  │  reads /dev/ttyACM0 │  ────────▶ │  spawn proxy  │
-   │  GPIO 33 → "normal" ─────────▶  │  dispatches CLI     │  ────────▶ │  kill proxy   │
-   └────────────────┘                └─────────────────────┘            └───────────────┘
+   ┌─ ESP32 panel ──┐   USB-serial   ┌─ trigger-serial.sh ─┐    exec    ┌─ rtspoof-ctl ──────┐
+   │ GPIO32 "attack"  ───────────▶   │  reads /dev/ttyACM0 │  ───────▶  │ arpspoof on + spoof│
+   │ GPIO33 "reset"   ───────────▶   │  CMD_MAP: word →    │  ───────▶  │ panic (all off)    │
+   │ GPIO25 "spoof"   ───────────▶   │  rtspoof-ctl argv   │  ───────▶  │ spawn inject proxy │
+   │ GPIO26 "normal"  ───────────▶   │                     │  ───────▶  │ kill proxy         │
+   │ GPIO27 "arpspoof"───────────▶   │                     │  ───────▶  │ arpspoof on        │
+   │ GPIO14 "status"  ───────────▶   │                     │  ───────▶  │ report state       │
+   └────────────────┘                └─────────────────────┘            └────────────────────┘
 ```
 
-The CLI is deliberately boring. One subcommand per state, a PID file in
+Each ESP32 button prints one **command word**; the bridge's `CMD_MAP`
+table correlates that word to an `rtspoof-ctl` subcommand. Add a button
+by adding a row to `esp32/button.ino`'s `BUTTONS[]` table and a matching
+key to `CMD_MAP` — those two tables are the whole contract.
+
+The CLI is deliberately boring. One subcommand per action, PID files in
 `/tmp`, a config file next to it. Each call is a one-shot: no daemon,
 no web UI, nothing to leave running between presses.
 
@@ -19,10 +28,30 @@ no web UI, nothing to leave running between presses.
 
 | File | What it is |
 |---|---|
-| `rtspoof-ctl`        | Python CLI. Subcommands: `spoof`, `normal`, `toggle`, `status`, `logs`. |
-| `config.example.ini` | Presaved proxy flags — copy to `config.ini` and edit. |
-| `trigger-serial.sh`  | Zero-dependency bash watcher; reads lines from a serial port and runs the CLI. |
-| `esp32/button.ino`   | Minimal Arduino sketch for an ESP32 with two pushbuttons. |
+| `rtspoof-ctl`        | Python CLI. Subcommands: `spoof`, `normal`, `toggle`, `arpspoof`, `attack`, `panic`, `status`, `logs`. |
+| `config.example.ini` | Presaved proxy **and** arpspoof settings — copy to `config.ini` and edit. |
+| `trigger-serial.sh`  | Zero-dependency bash watcher; reads words from a serial port and correlates each (via `CMD_MAP`) to a CLI subcommand. |
+| `esp32/button.ino`   | Arduino sketch: a declarative `BUTTONS[]` table, one GPIO → one command word. |
+
+### Command vocabulary
+
+What the ESP32 can say, and what the host does with it. The ESP32's
+`BUTTONS[]` table and the bridge's `CMD_MAP` are mirror images of this:
+
+| Serial word (+ aliases)      | `rtspoof-ctl`     | Effect |
+|---|---|---|
+| `attack`, `go`               | `attack`          | ARP-poison the pair **and** start injecting (full MITM, one press). |
+| `reset`, `panic`, `clear`    | `panic`           | Stop the proxy, stop arpspoof, restore `ip_forward`. Safe to spam. |
+| `spoof`, `inject`, `s`       | `spoof`           | Start the inject proxy only. |
+| `normal`, `stop`, `n`        | `normal`          | Stop the proxy only. |
+| `toggle`, `t`                | `toggle`          | Flip the proxy between spoof/normal. |
+| `arpspoof`, `arp`            | `arpspoof on`     | Start ARP poisoning only (no inject). |
+| `unarp`, `noarp`             | `arpspoof off`    | Stop ARP poisoning, restore `ip_forward`. |
+| `status`, `?`               | `status`          | Print proxy + arpspoof state (to the bridge's stdout). |
+
+Words are matched case-insensitively and whitespace-trimmed. Anything
+not in the table is logged and ignored, and so are lines beginning with
+`#` (the ESP32's boot banner).
 
 ## Setup
 
@@ -58,43 +87,67 @@ chmod +x rtspoof-ctl trigger-serial.sh
 ### 4. Smoke-test from the shell
 
 ```bash
-sudo ./rtspoof-ctl status      # → state: normal (proxy not running)
+sudo ./rtspoof-ctl status      # → proxy: normal / arpspoof: off
 sudo ./rtspoof-ctl spoof       # → spoofing · pid=... · log=/tmp/rtspoof-ctl.log
-sudo ./rtspoof-ctl status      # → state: spoofing · pid=... · up 2s
+sudo ./rtspoof-ctl status      # → proxy: spoofing · pid=... · up 2s
 sudo ./rtspoof-ctl logs -f     # watch what the proxy is doing
 sudo ./rtspoof-ctl normal      # → stopped (pid=...)
 ```
 
-`sudo` because the proxy binds port 554 and (usually) does ARP-adjacent
-work. If you've `setcap`'d the binary you can run as yourself; the pid
-file in `/tmp` works for either.
+`sudo` because the proxy binds port 554 and the ARP side rewrites
+`ip_forward` and sends raw frames. If you've `setcap`'d the proxy binary
+you can run *it* as yourself; arpspoof still needs root. The pid files in
+`/tmp` work for either.
 
-### 5. (Optional) ARP spoofing
+### 5. ARP spoofing — now driven by the CLI
 
 The proxy only intercepts what already lands on this host. For the full
-NVR→camera MITM you still need `arpspoof` running from a separate
-terminal — the usual pair of commands:
+NVR→camera MITM you need `arpspoof` poisoning both victims. That used to
+be a manual pair of commands; `rtspoof-ctl` now owns it, so the ESP32 can
+trigger it too. Fill in the `[arpspoof]` section of `config.ini`
+(`iface`, `nvr_ip`, `camera_ip`), then:
 
 ```bash
-sudo sysctl -w net.ipv4.ip_forward=1
-sudo arpspoof -i eth0 -t <NVR_IP> <CAMERA_IP>  &
-sudo arpspoof -i eth0 -t <CAMERA_IP> <NVR_IP>  &
+sudo ./rtspoof-ctl arpspoof on   # enables ip_forward + poisons both ways
+sudo ./rtspoof-ctl status        # → arpspoof: on · pids=...,...
+sudo ./rtspoof-ctl arpspoof off  # kills both, restores ip_forward as found
 ```
 
-These stay up for the whole demo. The ESP32 button only toggles the
-inject proxy — not the ARP side.
+`arpspoof on` enables `ip_forward` (remembering its prior value),
+launches the two `arpspoof -t` processes, and tracks both PIDs. `off`
+(and `panic`) SIGTERM them — so arpspoof re-ARPs the victims back to
+their real MACs — then puts `ip_forward` back exactly as it was.
+
+For a one-press full attack, use `attack` (arpspoof on **then** spoof)
+and `panic`/`reset` to tear it all down:
+
+```bash
+sudo ./rtspoof-ctl attack        # arpspoof on + inject proxy
+sudo ./rtspoof-ctl panic         # proxy off + arpspoof off + ip_forward restored
+```
 
 ## The ESP32 side
 
 ### Wiring
 
-Two momentary pushbuttons to ground, no external resistors (the sketch
-enables internal pull-ups):
+One momentary pushbutton per command word, each to ground — no external
+resistors (the sketch enables internal pull-ups). The default
+`BUTTONS[]` table in `esp32/button.ino` wires six:
 
 ```
-    GPIO 32 ──[ button ]── GND          // "spoof"
-    GPIO 33 ──[ button ]── GND          // "normal"
+    GPIO 32 ──[ button ]── GND          // "attack"
+    GPIO 33 ──[ button ]── GND          // "reset"
+    GPIO 25 ──[ button ]── GND          // "spoof"
+    GPIO 26 ──[ button ]── GND          // "normal"
+    GPIO 27 ──[ button ]── GND          // "arpspoof"
+    GPIO 14 ──[ button ]── GND          // "status"
 ```
+
+Wire only the buttons you want — delete the rows you don't from
+`BUTTONS[]` (and the matching keys from `CMD_MAP` in `trigger-serial.sh`
+if you want the host to reject them). To add one, append a
+`{ <pin>, "<word>", HIGH, 0 }` row; use pull-up-capable pins (avoid
+input-only GPIO 34–39 and the boot-strapping pins 0/2/15).
 
 Any ESP32 dev board with USB-serial works. If yours uses a CP2102 or
 CH340 bridge, your port will be `/dev/ttyUSB0` instead of
@@ -134,24 +187,28 @@ socat -d -d pty,raw,echo=0 pty,raw,echo=0
 # terminal B — point the bridge at one end
 sudo ./trigger-serial.sh /dev/pts/5 9600
 
-# terminal C — pretend to be the ESP32
-printf 'spoof\n'  > /dev/pts/6
-printf 'normal\n' > /dev/pts/6
-printf 'toggle\n' > /dev/pts/6
+# terminal C — pretend to be the ESP32 pressing buttons
+printf 'attack\n'   > /dev/pts/6
+printf 'status\n'   > /dev/pts/6
+printf 'reset\n'    > /dev/pts/6
+printf 'arpspoof\n' > /dev/pts/6
+printf 'bogus\n'    > /dev/pts/6   # → "ignoring unknown command"
 ```
 
 Each `printf` lands as one "button press" and the bridge prints
-`> spoof` / `> normal` / `> toggle` as it dispatches. When the real
-ESP32 shows up, replace `/dev/pts/5` with `/dev/ttyACM0` and the
-rest of the setup is identical — the sketch sends those exact
-lines.
+`> attack → rtspoof-ctl attack` (etc.) as it dispatches, mirroring every
+word in `CMD_MAP`. When the real ESP32 shows up, replace `/dev/pts/5`
+with `/dev/ttyACM0` and the rest is identical — the sketch sends those
+exact lines.
 
-### One-button variant
+### One- or two-button variant
 
-If you only have one button on the panel, wire it to GPIO 32 and
-change the sketch's `Serial.println("spoof")` to
-`Serial.println("toggle")`. Each press then flips whichever state the
-proxy is in.
+If the panel only has room for one button, trim `BUTTONS[]` to a single
+row and give it the word you want — `{ 32, "toggle", HIGH, 0 }` to flip
+the proxy on every press, or `{ 32, "attack", HIGH, 0 }` paired with a
+second `{ 33, "reset", HIGH, 0 }` for a classic "on / off" pair that
+drives the full MITM. The host needs no changes: every default word is
+already in `CMD_MAP`.
 
 ## Why not just a hotkey?
 
@@ -173,5 +230,12 @@ demo.
   new path and pass it as the first argument.
 - Nothing happens when you press the button but the serial device is
   there — add a `cat` test: `sudo cat /dev/ttyACM0` and press the
-  button. If no `spoof`/`normal` lines appear, re-flash the sketch
+  button. You should see the boot banner (`# ready`, `# GPIO 32 ->
+  attack`, …) and one word per press. If not, re-flash the sketch
   (the ESP32 occasionally boots into bootloader mode).
+- A press prints `ignoring unknown command` — the word the ESP32 sent
+  isn't a key in `CMD_MAP`. The two tables have drifted: make the
+  sketch's `BUTTONS[]` word match a `CMD_MAP` key in `trigger-serial.sh`.
+- `arpspoof on` exits immediately — check `[arpspoof]` `iface`/`nvr_ip`/
+  `camera_ip`, that you're root, and `/tmp/rtspoof-ctl.log`. `ip_forward`
+  is auto-restored on the failure.
