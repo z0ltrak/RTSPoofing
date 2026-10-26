@@ -128,6 +128,36 @@ sudo ./rtspoof-ctl panic         # proxy off + arpspoof off + ip_forward restore
 
 ## The ESP32 side
 
+### ESP32-C3 display button (`esp32_hacking_button`)
+
+Upload `esp32_hacking_button/arduino/HackingButton/HackingButton.ino` with its
+existing ESP32-C3 / TFT_eSPI settings and GPIO6-to-GPIO7 button wiring. After
+the proxy, capture and `config.ini` setup above, close Arduino Serial Monitor
+and run this bridge on the Linux RTSPoofing host:
+
+```bash
+cd Trigger
+sudo ./trigger-serial.sh /dev/ttyACM0 115200
+```
+
+Each accepted press sends `ANIMATION_START`, mapped to `rtspoof-ctl attack`.
+When the display returns to READY, it sends `ANIMATION_END`, mapped to
+`rtspoof-ctl panic`: stop injection and ARP spoofing and restore `ip_forward`.
+Injection is requested for the **whole 14.5-second animation**, starting at
+the press, including the simulated preparation phases. There is no separate
+host timer to keep in sync. Held or busy presses do not extend the demo.
+The bridge also tears down an active demo on Ctrl-C, termination or serial EOF
+(for example, USB unplug), and rolls back a failed start.
+
+Normal operation requires the viewer to connect to the camera's address,
+with the existing lab routing configured to reach the proxy during the demo.
+Proxy startup, ARP restoration and viewer reconnection add latency; the serial
+events control when injection starts/stops, not exact video display timing.
+Use this bridge alone on the port; the Arduino project's Python listener is
+an optional standalone callback example and does not control RTSPoofing.
+
+The six-button sketch below remains available at its original 9600 baud.
+
 ### Wiring
 
 One momentary pushbutton per command word, each to ground — no external

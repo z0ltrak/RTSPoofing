@@ -24,6 +24,8 @@
 #
 # Usage: ./trigger-serial.sh [port] [baud]
 # Defaults: /dev/ttyACM0 @ 9600 bps.
+# For esp32_hacking_button/HackingButton.ino, pass 115200 as the baud rate.
+# ANIMATION_START / ANIMATION_END bracket the entire 14.5-second demo.
 
 set -euo pipefail
 
@@ -35,6 +37,7 @@ CTL="$HERE/rtspoof-ctl"
 # ---- the correlation table -----------------------------------------------
 # word (lowercased, trimmed)  →  rtspoof-ctl arguments
 declare -A CMD_MAP=(
+  [animation_start]="attack" [animation_end]="panic"
   [attack]="attack"       [go]="attack"
   [reset]="panic"         [panic]="panic"       [clear]="panic"
   [spoof]="spoof"         [inject]="spoof"      [s]="spoof"
@@ -69,6 +72,19 @@ echo "trigger-serial: ctrl-c to stop"
 # Open the port once; the loop reads lines from fd 3 without re-opening.
 exec 3< "$PORT"
 
+# Only a demo started by this bridge needs automatic teardown on exit/unplug.
+demo_active=0
+stop_demo() {
+  if (( demo_active )); then
+    "$CTL" panic || return
+    demo_active=0
+  fi
+}
+trap stop_demo EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
 while IFS= read -r line <&3; do
   # Normalise: strip CR/LF/tabs/spaces, lowercase.
   cmd="$(printf '%s' "$line" | tr -d '\r\n\t ' | tr '[:upper:]' '[:lower:]')"
@@ -80,9 +96,19 @@ while IFS= read -r line <&3; do
       if [ -z "$args" ]; then
         echo "serial: ignoring unknown command: $cmd"
       else
+        if [ "$cmd" = animation_start ]; then
+          (( demo_active )) && continue  # Duplicate start must not restart it.
+          demo_active=1
+        elif [ "$cmd" = animation_end ] && (( ! demo_active )); then
+          continue
+        fi
         echo "> $cmd  →  rtspoof-ctl $args"
         # shellcheck disable=SC2086  # $args is a trusted, space-split argv
-        "$CTL" $args || true
+        if "$CTL" $args; then
+          if [ "$args" = panic ]; then demo_active=0; fi
+        elif [ "$cmd" = animation_start ]; then
+          stop_demo || true  # Roll back a partially started demo.
+        fi
       fi
       ;;
   esac
