@@ -71,9 +71,15 @@ transition: fade
 </v-clicks>
 </div>
 
-<div class="mt-4 card max-w-md mx-auto text-center">
-  <div class="accent font-bold flex items-center justify-center gap-2"><mdi-linkedin class="inline-block" /> LinkedIn</div>
-  <div class="mt-1 dim text-sm">linkedin.com/in/martín-lópez-aranburu</div>
+<div class="mt-4 flex justify-center gap-4 max-w-xl mx-auto">
+  <div class="card flex-1 text-center">
+    <div class="accent font-bold flex items-center justify-center gap-2"><mdi-linkedin class="inline-block" /> LinkedIn</div>
+    <div class="mt-1 dim text-sm">linkedin.com/in/martín-lópez-aranburu</div>
+  </div>
+  <div class="card flex-1 text-center">
+    <div class="accent font-bold flex items-center justify-center gap-2"><mdi-github class="inline-block" /> GitHub</div>
+    <div class="mt-1 dim text-sm">github.com/z0ltrak</div>
+  </div>
 </div>
 
 <!--
