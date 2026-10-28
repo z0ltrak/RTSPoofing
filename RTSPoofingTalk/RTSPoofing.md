@@ -678,13 +678,6 @@ transition: slide-up
 
 </div>
 
-<v-click>
-<div class="mt-6 text-center warn text-lg italic">
-"If your security system can be fooled<br/>
-by a few hundred lines of code...<br/>
-maybe it isn't as secure as the sticker on the box suggests."
-</div>
-</v-click>
 
 <!--
 If time is short, this is the slide to expand to compensate — these five
@@ -703,7 +696,7 @@ class: text-center end
 
 <div class="mt-8 dim">
 Code available after the talk, for research and authorized testing.<br/>
-Please use it responsibly — and get written authorization first.
+Please use it responsibly and get written authorization first.
 </div>
 
 <div class="mt-8 text-sm dim">

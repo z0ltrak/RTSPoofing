@@ -50,10 +50,10 @@ RTSPoofing/
 │   └── README.md          # Usage
 │
 ├── Trigger/               # One-shot CLI + ESP32 button trigger for live demos
-│   ├── rtspoof-ctl        # Python CLI: spoof / normal / toggle / status / logs
-│   ├── trigger-serial.sh  # Bash watcher — reads /dev/ttyACM0, dispatches the CLI
-│   ├── config.example.ini # Presaved proxy flags for the spoof state
-│   ├── esp32/button.ino   # Minimal ESP32 sketch (two buttons → serial lines)
+│   ├── rtspoof-ctl        # Python CLI: spoof/normal/toggle/arpspoof/attack/panic/status/logs
+│   ├── trigger-serial.sh  # Bash watcher — reads /dev/ttyACM0, maps words → CLI subcommands
+│   ├── config.example.ini # Presaved proxy + arpspoof settings
+│   ├── esp32/button.ino   # ESP32 sketch — a BUTTONS[] table, one GPIO per command word
 │   └── README.md          # Usage, wiring, troubleshooting
 │
 ├── captured.rtp           # Example capture file
@@ -193,6 +193,21 @@ Use this when an RTSP session already exists and needs to be re-established thro
 ## Authorized Lab Workflow
 
 The following workflow is intended for isolated lab environments or explicitly authorized security testing.
+
+> **Shortcut:** steps 1, 2 and 4 below can be run as single commands — or
+> from a physical ESP32 button — via `Trigger/rtspoof-ctl`. After filling in
+> `Trigger/config.ini` (`[proxy]` + `[arpspoof]`):
+>
+> ```bash
+> sudo ./Trigger/rtspoof-ctl attack   # ip_forward on + arpspoof both ways + inject proxy
+> sudo ./Trigger/rtspoof-ctl status   # show proxy + arpspoof state
+> sudo ./Trigger/rtspoof-ctl panic    # stop everything, restore ip_forward
+> ```
+>
+> `arpspoof on`/`attack` manage `ip_forward` and the arpspoof pair for you and
+> restore them on `panic`. See `Trigger/README.md` for the full command
+> vocabulary and the ESP32 button wiring. The manual steps below are the
+> equivalent long form.
 
 ### 1. Enable IP Forwarding
 
