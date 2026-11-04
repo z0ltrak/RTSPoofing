@@ -29,7 +29,7 @@ _redirect_added = False
 # How long the fake feed should be *visible*. The actual hold adds the
 # proxy's inject_delay warm-up on top (see _hold_seconds), so the injected
 # stream is on screen for this many seconds before we restore.
-SPOOF_SECONDS = 30
+SPOOF_SECONDS = 20
 
 # One cycle at a time: a second ANIMATION_START while the feed is already
 # spoofed is ignored rather than stacking timers / restarting the proxy.
